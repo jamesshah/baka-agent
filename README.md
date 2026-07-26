@@ -104,14 +104,15 @@ Demo tool: ask *"what time is it?"* — the model can call `get_current_time`.
 
 ## Project layout
 
-| File | Role |
+| Path | Role |
 |---|---|
-| `app.py` | FastAPI: `/health`, `/webhooks/receive` |
-| `sendblue_client.py` | Thin wrapper around `SendblueAPI.messages.send` |
-| `agent.py` | From-scratch agent loop + per-number history |
-| `llm.py` | Raw `httpx` client to llama-server |
-| `tools.py` | Tool registry (`get_current_time`) |
+| `app.py` | FastAPI: `/health`, `/webhooks/receive`; wires adapters |
 | `config.py` | Settings from `.env` |
+| `agents/` | `Agent` ABC + `ChatAgent` |
+| `tools/` | `Tool` ABC, `ToolRegistry`, `GetCurrentTimeTool` |
+| `llm/` | `LLMClient` ABC + `LlamaServerAdapter` |
+| `messaging/` | `MessagingClient` ABC + `SendblueAdapter` |
+| `webhooks/` | `SendblueWebhookHandler` (verify + receive + reply) |
 
 ## Notes
 
