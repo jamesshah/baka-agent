@@ -27,6 +27,10 @@ class Settings(BaseSettings):
         "Keep replies concise and conversational."
     )
 
+    # Cursor-compatible MCP config (mcpServers in a JSON file).
+    mcp_config_path: str = "mcp.json"
+    mcp_enabled: bool = True
+
     @property
     def allowed_numbers_set(self) -> set[str]:
         if not self.allowed_numbers.strip():

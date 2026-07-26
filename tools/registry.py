@@ -17,6 +17,23 @@ class ToolRegistry:
     def register(self, tool: Tool) -> None:
         self._tools[tool.name] = tool
 
+    def names(self) -> list[str]:
+        return sorted(self._tools)
+
+    def local_names(self) -> list[str]:
+        """Names of non-MCP (locally defined) tools only."""
+        from mcp_client.tool import McpTool
+
+        return sorted(
+            name for name, tool in self._tools.items() if not isinstance(tool, McpTool)
+        )
+
+    def count(self) -> int:
+        return len(self._tools)
+
+    def local_count(self) -> int:
+        return len(self.local_names())
+
     def specs(self) -> list[dict[str, Any]]:
         return [tool.to_openai_spec() for tool in self._tools.values()]
 

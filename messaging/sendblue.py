@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any, Literal
 
 from sendblue_api import SendblueAPI
+from sendblue_api.types.webhook_configuration import WebhookConfiguration
 
 from messaging.base import MessagingClient
 
@@ -34,6 +35,53 @@ class SendblueAdapter(MessagingClient):
                 api_secret=self._api_secret,
             )
         return self._client
+
+    def webhook_health_check(self, *, secret_configured: bool) -> dict[str, Any]:
+        """Check API auth and whether a receive webhook is registered."""
+        if not self._api_key or not self._api_secret:
+            return {
+                "status": "unconfigured",
+                "secret_configured": secret_configured,
+                "receive_urls": [],
+                "detail": "SENDBLUE_API_KEY / SENDBLUE_API_SECRET not set",
+            }
+
+        try:
+            response = self._get_client().webhooks.list()
+        except Exception as exc:  # noqa: BLE001 — surface API failures in health
+            return {
+                "status": "error",
+                "secret_configured": secret_configured,
+                "receive_urls": [],
+                "detail": str(exc),
+            }
+
+        receive = []
+        if response.webhooks is not None and response.webhooks.receive:
+            receive = response.webhooks.receive
+
+        urls = [_webhook_url(entry) for entry in receive]
+        urls = [u for u in urls if u]
+
+        if not urls:
+            return {
+                "status": "error",
+                "secret_configured": secret_configured,
+                "receive_urls": [],
+                "detail": "No receive webhook registered in Sendblue",
+            }
+
+        status = "ok" if secret_configured else "degraded"
+        detail = None
+        if not secret_configured:
+            detail = "Receive webhook registered, but SENDBLUE_GLOBAL_WEBHOOK_SECRET is unset"
+
+        return {
+            "status": status,
+            "secret_configured": secret_configured,
+            "receive_urls": urls,
+            "detail": detail,
+        }
 
     def _require_from_number(self) -> str:
         if not self._from_number:
@@ -76,3 +124,9 @@ class SendblueAdapter(MessagingClient):
             )
 
         return self._get_client().typing_indicators.send(**kwargs)
+
+
+def _webhook_url(entry: str | WebhookConfiguration) -> str:
+    if isinstance(entry, str):
+        return entry
+    return entry.url
