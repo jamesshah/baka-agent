@@ -29,6 +29,8 @@ cp .env.example .env
 | `ALLOWED_NUMBERS` | Optional comma-separated E.164 allowlist; empty = allow all |
 | `SYSTEM_PROMPT` | System prompt for the agent |
 | `MAX_HISTORY_MESSAGES` / `MAX_AGENT_ITERATIONS` | History trim + tool-call loop cap |
+| `MCP_ENABLED` | Connect MCP servers on startup (default `true`) |
+| `MCP_CONFIG_PATH` | Path to Cursor-style `mcp.json` (default `mcp.json`) |
 
 On free shared-line Sendblue plans, add the recipient as a contact and have them text your number once to complete verification before messaging works.
 
@@ -58,6 +60,8 @@ uvicorn app:app --host 0.0.0.0 --port 8000 --reload
 ```
 
 Health check: `curl http://127.0.0.1:8000/health`
+
+`/health` probes tools, MCP servers, the model server, and whether a Sendblue receive webhook is registered. Overall `status` is `ok`, `degraded`, or `error` (HTTP 503 when `error`).
 
 ### 3. Expose the webhook (local tunnel)
 
@@ -102,17 +106,57 @@ Inbound messages hit `/webhooks/receive`, which returns `200` immediately and ru
 
 Demo tool: ask *"what time is it?"* — the model can call `get_current_time`.
 
+## MCP tools
+
+The agent can also call tools from one or more [MCP](https://modelcontextprotocol.io) servers. Config uses the same JSON shape as Cursor (`mcpServers`).
+
+```bash
+cp mcp.json.example mcp.json
+# edit mcp.json — add as many servers as you want
+```
+
+Example with two servers at once:
+
+```json
+{
+  "mcpServers": {
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "."]
+    },
+    "remote-api": {
+      "url": "https://example.com/mcp",
+      "headers": {
+        "Authorization": "Bearer ${env:MY_TOKEN}"
+      }
+    }
+  }
+}
+```
+
+Supported transports:
+
+| Config | Transport |
+|---|---|
+| `command` + optional `args` / `env` / `cwd` | stdio (local process) |
+| `url` (default) or `"type": "streamableHttp"` | Streamable HTTP |
+| `url` + `"type": "sse"` | SSE |
+
+On startup the client connects to every server, discovers tools, and registers them in the same `ToolRegistry` the agent already uses. Tool names are always `mcp__<server>__<tool>` (e.g. `mcp__filesystem__list_directory`). Set `MCP_ENABLED=false` to skip MCP entirely.
+
 ## Project layout
 
 | Path | Role |
 |---|---|
-| `app.py` | FastAPI: `/health`, `/webhooks/receive`; wires adapters |
+| `app.py` | FastAPI: `/health`, `/webhooks/receive`; wires adapters + MCP lifespan |
 | `config.py` | Settings from `.env` |
 | `agents/` | `Agent` ABC + `ChatAgent` |
 | `tools/` | `Tool` ABC, `ToolRegistry`, `GetCurrentTimeTool` |
+| `mcp_client/` | Cursor-style `mcp.json` loader + multi-server MCP hub |
 | `llm/` | `LLMClient` ABC + `LlamaServerAdapter` |
 | `messaging/` | `MessagingClient` ABC + `SendblueAdapter` |
 | `webhooks/` | `SendblueWebhookHandler` (verify + receive + reply) |
+| `mcp.json.example` | Sample MCP server config |
 
 ## Notes
 
