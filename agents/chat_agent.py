@@ -67,10 +67,9 @@ class ChatAgent(Agent):
         history.append({"role": "user", "content": user_text})
         self._trim_history(history)
 
-        tool_specs = self._tools.specs()
-
         for iteration in range(self._max_agent_iterations):
             logger.info("agent iteration %s for %s", iteration + 1, session_id)
+            tool_specs = self._tools.specs()
             message = self._llm.chat(history, tools=tool_specs)
 
             tool_calls = message.get("tool_calls") or []
@@ -83,7 +82,9 @@ class ChatAgent(Agent):
                     arguments = fn.get("arguments") or "{}"
                     call_id = call.get("id") or name
                     logger.info("tool call: %s(%s)", name, arguments)
-                    result = self._tools.execute(name, arguments)
+                    result = self._tools.execute(
+                        name, arguments, session_id=session_id
+                    )
                     history.append(
                         {
                             "role": "tool",

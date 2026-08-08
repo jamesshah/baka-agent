@@ -31,6 +31,8 @@ cp .env.example .env
 | `MAX_HISTORY_MESSAGES` / `MAX_AGENT_ITERATIONS` | History trim + tool-call loop cap |
 | `MCP_ENABLED` | Connect MCP servers on startup (default `true`) |
 | `MCP_CONFIG_PATH` | Path to Cursor-style `mcp.json` (default `mcp.json`) |
+| `MCP_OAUTH_DATA_DIR` | Where OAuth tokens are stored (default `.data/mcp-oauth`) |
+| `MCP_OAUTH_OWNER_NUMBER` | Phone that owns SnapTrade tokens (defaults to sole `ALLOWED_NUMBERS` entry) |
 
 On free shared-line Sendblue plans, add the recipient as a contact and have them text your number once to complete verification before messaging works.
 
@@ -135,7 +137,7 @@ cp mcp.json.example mcp.json
 # edit mcp.json — add as many servers as you want
 ```
 
-Example with two servers at once:
+Example with local + remote OAuth (SnapTrade):
 
 ```json
 {
@@ -143,6 +145,11 @@ Example with two servers at once:
     "filesystem": {
       "command": "npx",
       "args": ["-y", "@modelcontextprotocol/server-filesystem", "."]
+    },
+    "snaptrade": {
+      "url": "https://mcp.snaptrade.com/mcp",
+      "auth": "oauth",
+      "scopes": ["read"]
     },
     "remote-api": {
       "url": "https://example.com/mcp",
@@ -161,8 +168,20 @@ Supported transports:
 | `command` + optional `args` / `env` / `cwd` | stdio (local process) |
 | `url` (default) or `"type": "streamableHttp"` | Streamable HTTP |
 | `url` + `"type": "sse"` | SSE |
+| `"auth": "oauth"` on a `url` server | OAuth device-code link (tokens under `MCP_OAUTH_DATA_DIR`) |
 
-On startup the client connects to every server, discovers tools, and registers them in the same `ToolRegistry` the agent already uses. Tool names are always `mcp__<server>__<tool>` (e.g. `mcp__filesystem__list_directory`). Set `MCP_ENABLED=false` to skip MCP entirely.
+On startup the client connects to every non-OAuth server, discovers tools, and registers them as `mcp__<server>__<tool>`. OAuth servers (SnapTrade) stay `pending_auth` until linked; if tokens already exist on disk they reconnect automatically with silent refresh — no re-login.
+
+### SnapTrade (iMessage OAuth)
+
+SnapTrade MCP is read-only Personal OAuth ([docs](https://docs.snaptrade.com/docs/mcp-server)). Add the `snaptrade` entry from `mcp.json.example`, set `MCP_OAUTH_OWNER_NUMBER` (or a single `ALLOWED_NUMBERS` entry), then text:
+
+1. **link snaptrade** — agent replies with a verification URL; open it, log in, approve **read**.
+2. After approval you get a confirmation text; portfolio tools (`mcp__snaptrade__*`) are registered.
+3. Ask about balances, positions, orders as usual. Tokens persist under `.data/mcp-oauth/` across restarts.
+4. **unlink snaptrade** — revokes access and deletes local tokens (or revoke under SnapTrade **Settings → Connected apps**).
+
+Local helper tools: `link_snaptrade`, `snaptrade_status`, `unlink_snaptrade`. Set `MCP_ENABLED=false` to skip MCP entirely.
 
 ## Project layout
 
@@ -171,8 +190,8 @@ On startup the client connects to every server, discovers tools, and registers t
 | `app.py` | FastAPI: `/health`, `/webhooks/receive`; wires adapters + MCP lifespan |
 | `config.py` | Settings from `.env` |
 | `agents/` | `Agent` ABC + `ChatAgent` |
-| `tools/` | `Tool` ABC, `ToolRegistry`, `GetCurrentTimeTool` |
-| `mcp_client/` | Cursor-style `mcp.json` loader + multi-server MCP hub |
+| `tools/` | `Tool` ABC, `ToolRegistry`, local tools (time, SnapTrade link/status/unlink) |
+| `mcp_client/` | Cursor-style `mcp.json` loader, multi-server hub, OAuth device flow + token store |
 | `llm/` | `LLMClient` ABC + `LlamaServerAdapter` |
 | `messaging/` | `MessagingClient` ABC + `SendblueAdapter` |
 | `webhooks/` | `SendblueWebhookHandler` (verify + receive + reply) |

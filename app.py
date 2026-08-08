@@ -13,8 +13,15 @@ from agents import ChatAgent
 from config import get_settings
 from llm import LlamaServerAdapter
 from mcp_client import MultiServerMcpClient, load_mcp_config
+from mcp_client.token_store import FileTokenStore
 from messaging import SendblueAdapter
-from tools import GetCurrentTimeTool, ToolRegistry
+from tools import (
+    GetCurrentTimeTool,
+    LinkSnaptradeTool,
+    SnaptradeStatusTool,
+    ToolRegistry,
+    UnlinkSnaptradeTool,
+)
 from webhooks import SendblueWebhookHandler
 
 logging.basicConfig(
@@ -46,6 +53,39 @@ _messaging = SendblueAdapter(
 _webhook = SendblueWebhookHandler(agent=_agent, messaging=_messaging)
 
 
+def _on_mcp_tools_changed(added: list[Any], removed: list[str]) -> None:
+    for name in removed:
+        _tools.unregister(name)
+    for tool in added:
+        _tools.register(tool)
+    if added or removed:
+        logger.info(
+            "MCP tools updated: +%d -%d (registry=%d)",
+            len(added),
+            len(removed),
+            _tools.count(),
+        )
+
+
+def _on_mcp_linked(server: str, phone: str) -> None:
+    message = (
+        f"{server.title()} is linked. You can ask about balances, positions, "
+        "and orders."
+    )
+    try:
+        _messaging.send_message(phone, message)
+    except Exception:  # noqa: BLE001
+        logger.exception("Failed to send %s linked confirmation to %s", server, phone)
+
+
+def _register_oauth_local_tools(client: MultiServerMcpClient) -> None:
+    if client.has_server("snaptrade"):
+        _tools.register(LinkSnaptradeTool(client))
+        _tools.register(SnaptradeStatusTool(client))
+        _tools.register(UnlinkSnaptradeTool(client))
+        logger.info("Registered SnapTrade link/status/unlink tools")
+
+
 def _start_mcp() -> MultiServerMcpClient | None:
     if not _settings.mcp_enabled:
         logger.info("MCP disabled via MCP_ENABLED=false")
@@ -55,10 +95,17 @@ def _start_mcp() -> MultiServerMcpClient | None:
     if not servers:
         return None
 
-    client = MultiServerMcpClient(servers)
+    client = MultiServerMcpClient(
+        servers,
+        token_store=FileTokenStore(_settings.mcp_oauth_data_dir),
+        oauth_owner_phone=_settings.resolved_oauth_owner_number,
+        on_tools_changed=_on_mcp_tools_changed,
+        on_linked=_on_mcp_linked,
+    )
     client.start()
     for tool in client.tools:
         _tools.register(tool)
+    _register_oauth_local_tools(client)
     logger.info("Registered %d MCP tool(s)", len(client.tools))
     return client
 
@@ -69,6 +116,7 @@ def _mcp_health() -> dict[str, Any]:
             "status": "disabled",
             "configured": [],
             "connected": [],
+            "pending_auth": [],
             "tool_count": 0,
             "detail": "MCP_ENABLED=false",
         }
@@ -77,6 +125,7 @@ def _mcp_health() -> dict[str, Any]:
             "status": "disabled",
             "configured": [],
             "connected": [],
+            "pending_auth": [],
             "tool_count": 0,
             "detail": "No MCP servers configured or startup failed",
         }
