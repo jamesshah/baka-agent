@@ -36,7 +36,27 @@ On free shared-line Sendblue plans, add the recipient as a contact and have them
 
 ## Run
 
-### 1. Start llama.cpp
+### Quick start (macOS, background)
+
+```bash
+chmod +x run.sh   # once
+./run.sh start            # llama-server + agent
+./run.sh restart agent    # only re-run the agent
+./run.sh restart llama    # only re-run llama-server
+./run.sh status
+./run.sh logs             # Ctrl-C to stop tailing
+./run.sh stop
+```
+
+Override the Hugging Face model or ports:
+
+```bash
+LLAMA_HF_REPO=Qwen/Qwen2.5-3B-Instruct-GGUF:Q4_K_M ./run.sh start
+```
+
+PIDs and logs live under `.run/` (gitignored).
+
+### Manual: 1. Start llama.cpp
 
 Install (macOS):
 
@@ -52,7 +72,7 @@ llama-server -hf Qwen/Qwen2.5-3B-Instruct-GGUF:Q4_K_M --port 8080 --jinja
 
 Any OpenAI-compatible server that exposes `/v1/chat/completions` works — point `LLAMA_BASE_URL` at it.
 
-### 2. Start the agent server
+### Manual: 2. Start the agent server
 
 ```bash
 source .venv/bin/activate
