@@ -13,6 +13,7 @@ from typing import Any, Literal
 logger = logging.getLogger(__name__)
 
 TransportKind = Literal["stdio", "sse", "streamable_http"]
+AuthKind = Literal["none", "oauth"]
 
 _ENV_VAR_RE = re.compile(r"\$\{env:([^}]+)\}")
 _VAR_RE = re.compile(r"\$\{([^}]+)\}")
@@ -30,6 +31,8 @@ class McpServerConfig:
     cwd: str | None = None
     url: str | None = None
     headers: dict[str, str] = field(default_factory=dict)
+    auth: AuthKind = "none"
+    scopes: list[str] = field(default_factory=list)
 
 
 def _resolve_string(value: str, *, workspace: Path) -> str:
@@ -79,18 +82,29 @@ def _detect_transport(raw: dict[str, Any]) -> TransportKind:
     raise ValueError("MCP server config needs either 'command' (stdio) or 'url' (remote)")
 
 
+def _detect_auth(raw: dict[str, Any]) -> AuthKind:
+    explicit = (raw.get("auth") or "").strip().lower()
+    if explicit == "oauth":
+        return "oauth"
+    if explicit in {"none", ""}:
+        return "none"
+    raise ValueError(f"Unknown auth mode '{explicit}' (expected 'none' or 'oauth')")
+
+
 def _parse_server(name: str, raw: dict[str, Any], *, workspace: Path) -> McpServerConfig:
     data = _resolve_value(raw, workspace=workspace)
     if not isinstance(data, dict):
         raise ValueError(f"Server '{name}' config must be an object")
 
     transport = _detect_transport(data)
+    auth = _detect_auth(data)
     command = data.get("command")
     url = data.get("url")
     args = data.get("args") or []
     env = data.get("env") or {}
     headers = data.get("headers") or {}
     cwd = data.get("cwd")
+    scopes_raw = data.get("scopes") or []
 
     if not isinstance(args, list):
         raise ValueError(f"Server '{name}': 'args' must be a list")
@@ -98,13 +112,21 @@ def _parse_server(name: str, raw: dict[str, Any], *, workspace: Path) -> McpServ
         raise ValueError(f"Server '{name}': 'env' must be an object")
     if not isinstance(headers, dict):
         raise ValueError(f"Server '{name}': 'headers' must be an object")
+    if not isinstance(scopes_raw, list):
+        raise ValueError(f"Server '{name}': 'scopes' must be a list")
 
     if transport == "stdio":
         if not command or not isinstance(command, str):
             raise ValueError(f"Server '{name}': stdio transport requires 'command'")
+        if auth == "oauth":
+            raise ValueError(f"Server '{name}': oauth auth requires a remote 'url' transport")
     else:
         if not url or not isinstance(url, str):
             raise ValueError(f"Server '{name}': remote transport requires 'url'")
+
+    scopes = [str(s) for s in scopes_raw]
+    if auth == "oauth" and not scopes:
+        scopes = ["read"]
 
     return McpServerConfig(
         name=name,
@@ -115,6 +137,8 @@ def _parse_server(name: str, raw: dict[str, Any], *, workspace: Path) -> McpServ
         cwd=str(cwd) if cwd else None,
         url=url if isinstance(url, str) else None,
         headers={str(k): str(v) for k, v in headers.items()},
+        auth=auth,
+        scopes=scopes,
     )
 
 
@@ -130,7 +154,8 @@ def load_mcp_config(
       {
         "mcpServers": {
           "server-name": { "command": "...", "args": [...], "env": {...} },
-          "remote": { "url": "https://...", "headers": {...} }
+          "remote": { "url": "https://...", "headers": {...} },
+          "snaptrade": { "url": "https://mcp.snaptrade.com/mcp", "auth": "oauth" }
         }
       }
     """

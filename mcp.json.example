@@ -3,6 +3,11 @@
     "filesystem": {
       "command": "npx",
       "args": ["-y", "@modelcontextprotocol/server-filesystem", "."]
+    },
+    "snaptrade": {
+      "url": "https://mcp.snaptrade.com/mcp",
+      "auth": "oauth",
+      "scopes": ["read"]
     }
   }
 }
