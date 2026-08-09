@@ -14,6 +14,9 @@ class Settings(BaseSettings):
     sendblue_api_secret: str = ""
     sendblue_from_number: str = ""
     sendblue_global_webhook_secret: str = ""
+    # Public URL for POST /webhooks/receive (tunnel host). Used to auto-register
+    # the Sendblue receive webhook on startup when missing.
+    sendblue_webhook_url: str = ""
 
     llama_base_url: str = "http://127.0.0.1:8080/v1"
     llama_model: str = "local"
@@ -22,14 +25,6 @@ class Settings(BaseSettings):
 
     max_history_messages: int = 40
     max_agent_iterations: int = 5
-    system_prompt: str = (
-        "You are a helpful local iMessage assistant. "
-        "Keep replies concise and conversational. "
-        "SnapTrade portfolio tools are read-only and require a one-time link: "
-        "if the user asks about balances/positions/orders and SnapTrade is not "
-        "linked, call link_snaptrade and send them the verification URL. "
-        "Brokerage connection links from SnapTrade expire in about 5 minutes."
-    )
 
     # Cursor-compatible MCP config (mcpServers in a JSON file).
     mcp_config_path: str = "mcp.json"

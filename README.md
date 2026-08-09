@@ -24,10 +24,10 @@ cp .env.example .env
 | `SENDBLUE_API_KEY` / `SENDBLUE_API_SECRET` | From [dashboard.sendblue.com](https://dashboard.sendblue.com) |
 | `SENDBLUE_FROM_NUMBER` | Your Sendblue line (E.164, e.g. `+15551234567`) |
 | `SENDBLUE_GLOBAL_WEBHOOK_SECRET` | Must match Sendblue's webhook `globalSecret` (or per-webhook `secret`). Verified via the `sb-signing-secret` header. |
+| `SENDBLUE_WEBHOOK_URL` | Public `https://…/webhooks/receive` URL. On startup the agent checks Sendblue and registers this URL if missing. |
 | `LLAMA_BASE_URL` | OpenAI-compatible base URL (default `http://127.0.0.1:8080/v1`) |
 | `LLAMA_MODEL` | Model id passed to `/chat/completions` (often just `local`) |
 | `ALLOWED_NUMBERS` | Optional comma-separated E.164 allowlist; empty = allow all |
-| `SYSTEM_PROMPT` | System prompt for the agent |
 | `MAX_HISTORY_MESSAGES` / `MAX_AGENT_ITERATIONS` | History trim + tool-call loop cap |
 | `MCP_ENABLED` | Connect MCP servers on startup (default `true`) |
 | `MCP_CONFIG_PATH` | Path to Cursor-style `mcp.json` (default `mcp.json`) |
@@ -97,30 +97,27 @@ Copy the generated `https://….trycloudflare.com` URL.
 
 ### 4. Register the receive webhook
 
-Dashboard: **Settings → Webhooks → Receive** → set to:
+Set `SENDBLUE_WEBHOOK_URL` to your tunnel URL + path, then start (or restart) the agent — it checks Sendblue on startup and registers the URL if missing:
 
+```bash
+# .env
+SENDBLUE_WEBHOOK_URL=https://<your-tunnel-host>/webhooks/receive
+SENDBLUE_GLOBAL_WEBHOOK_SECRET=your-shared-secret
 ```
-https://<your-tunnel-host>/webhooks/receive
+
+Or register without restarting:
+
+```bash
+curl -X POST http://127.0.0.1:8000/webhooks/register \
+  -H 'Content-Type: application/json' \
+  -d '{"url":"https://<your-tunnel-host>/webhooks/receive"}'
 ```
 
-Or via the SDK / a one-off Python snippet:
-
-```python
-from sendblue_api import SendblueAPI
-import os
-
-client = SendblueAPI(
-    api_key=os.environ["SENDBLUE_API_KEY"],
-    api_secret=os.environ["SENDBLUE_API_SECRET"],
-)
-client.webhooks.create(
-    webhooks=["https://<your-tunnel-host>/webhooks/receive"],
-    type="receive",
-    global_secret=os.environ["SENDBLUE_GLOBAL_WEBHOOK_SECRET"],
-)
-```
+You can still set it in the dashboard (**Settings → Webhooks → Receive**) if you prefer.
 
 Every `/webhooks/receive` request must include an `sb-signing-secret` header matching `SENDBLUE_GLOBAL_WEBHOOK_SECRET`, or it is rejected with `401`.
+
+Outbound replies are stripped of Markdown and split into ≤2000-character chunks before Sendblue send.
 
 ### 5. Text your Sendblue number
 
@@ -187,9 +184,9 @@ Local helper tools: `link_snaptrade`, `snaptrade_status`, `unlink_snaptrade`. Se
 
 | Path | Role |
 |---|---|
-| `app.py` | FastAPI: `/health`, `/webhooks/receive`; wires adapters + MCP lifespan |
+| `app.py` | FastAPI: `/health`, `/webhooks/register`, `/webhooks/receive`; wires adapters + MCP lifespan; ensures Sendblue webhook on start |
 | `config.py` | Settings from `.env` |
-| `agents/` | `Agent` ABC + `ChatAgent` |
+| `agents/` | `Agent` ABC + `ChatAgent` (owns `SYSTEM_PROMPT`) |
 | `tools/` | `Tool` ABC, `ToolRegistry`, local tools (time, SnapTrade link/status/unlink) |
 | `mcp_client/` | Cursor-style `mcp.json` loader, multi-server hub, OAuth device flow + token store |
 | `llm/` | `LLMClient` ABC + `LlamaServerAdapter` |

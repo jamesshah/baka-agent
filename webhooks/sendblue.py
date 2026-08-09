@@ -12,6 +12,7 @@ from fastapi.responses import JSONResponse
 from agents.base import Agent
 from config import get_settings
 from messaging.base import MessagingClient
+from messaging.format import chunk_text, strip_markdown
 
 logger = logging.getLogger(__name__)
 
@@ -78,10 +79,23 @@ class SendblueWebhookHandler:
             self._typing(from_number, "start")
 
             reply = self._agent.run_turn(from_number, content)
-            logger.info("replying to %s: %s", from_number, reply[:200])
+            plain = strip_markdown(reply)
+            chunks = chunk_text(plain)
+            if not chunks:
+                logger.warning("empty reply after format for %s — not sending", from_number)
+                self._typing(from_number, "stop")
+                return
+
+            logger.info(
+                "replying to %s (%d chunk(s)): %s",
+                from_number,
+                len(chunks),
+                chunks[0][:200],
+            )
 
             self._typing(from_number, "stop")
-            self._messaging.send_message(from_number, reply)
+            for chunk in chunks:
+                self._messaging.send_message(from_number, chunk)
         except Exception:
             logger.exception("failed to process message from %s", from_number)
             self._typing(from_number, "stop")

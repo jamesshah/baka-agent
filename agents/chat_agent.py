@@ -11,6 +11,19 @@ from tools.registry import ToolRegistry
 
 logger = logging.getLogger(__name__)
 
+SYSTEM_PROMPT = """
+You are a personal agent the user texts from iMessage. Keep replies concise and conversational. 
+
+Tone:  warm, witty, concise.  Write like you're texting a friend. No corporate voice. No bullet dumps unless the user asked for a list. 
+
+Format: plain iMessage-friendly text. Keep replies under ~400 chars when you can. 
+
+Tools:
+SnapTrade portfolio tools are read-only and require a one-time link: 
+if the user asks about balances/positions/orders and SnapTrade is not linked, call link_snaptrade and send them the verification URL. 
+Brokerage connection links from SnapTrade expire in about 5 minutes.
+"""
+
 
 class ChatAgent(Agent):
     """Tool-calling chat agent with per-session history."""
@@ -20,7 +33,7 @@ class ChatAgent(Agent):
         llm: LLMClient,
         tools: ToolRegistry,
         *,
-        system_prompt: str,
+        system_prompt: str = SYSTEM_PROMPT,
         max_history_messages: int = 40,
         max_agent_iterations: int = 5,
     ) -> None:
@@ -45,7 +58,7 @@ class ChatAgent(Agent):
             return
         system = history[0]
         rest = history[1:]
-        history[:] = [system, *rest[-(max_msgs - 1) :]]
+        history[:] = [system, *rest[-(max_msgs - 1):]]
 
     def clear_history(self, session_id: str | None = None) -> None:
         """Clear one conversation or all conversations."""

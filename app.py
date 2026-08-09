@@ -41,7 +41,6 @@ _mcp: MultiServerMcpClient | None = None
 _agent = ChatAgent(
     llm=_llm,
     tools=_tools,
-    system_prompt=_settings.system_prompt,
     max_history_messages=_settings.max_history_messages,
     max_agent_iterations=_settings.max_agent_iterations,
 )
@@ -149,6 +148,25 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     except Exception:  # noqa: BLE001 — app should still serve without MCP
         logger.exception("MCP startup failed; continuing without MCP tools")
         _mcp = None
+
+    try:
+        result = _messaging.ensure_receive_webhook(
+            _settings.sendblue_webhook_url,
+            global_secret=_settings.sendblue_global_webhook_secret,
+        )
+        status = result.get("status")
+        detail = result.get("detail")
+        if status == "ok":
+            logger.info("Sendblue webhook: %s", detail)
+        elif status == "missing":
+            logger.warning("Sendblue webhook: %s", detail)
+        elif status == "skipped":
+            logger.info("Sendblue webhook: %s", detail)
+        else:
+            logger.error("Sendblue webhook: %s", detail)
+    except Exception:  # noqa: BLE001
+        logger.exception("Sendblue webhook check/register failed")
+
     yield
     if _mcp is not None:
         _mcp.stop()
@@ -170,6 +188,7 @@ def health() -> JSONResponse:
     model_check = _llm.health_check()
     webhook_check = _messaging.webhook_health_check(
         secret_configured=bool(_settings.sendblue_global_webhook_secret),
+        expected_url=_settings.sendblue_webhook_url,
     )
 
     checks = {
@@ -181,6 +200,45 @@ def health() -> JSONResponse:
     overall = _overall_status(checks)
     body = {"status": overall, "checks": checks}
     return JSONResponse(body, status_code=200 if overall != "error" else 503)
+
+
+@app.post("/webhooks/register")
+async def register_webhook(request: Request) -> JSONResponse:
+    """
+    Register (or confirm) the Sendblue receive webhook.
+
+    Body is optional JSON: ``{"url": "https://.../webhooks/receive"}``.
+    Falls back to ``SENDBLUE_WEBHOOK_URL`` when ``url`` is omitted.
+    """
+    url = _settings.sendblue_webhook_url
+    try:
+        body = await request.json()
+    except Exception:
+        body = None
+    if isinstance(body, dict):
+        provided = (body.get("url") or "").strip()
+        if provided:
+            url = provided
+
+    if not url:
+        return JSONResponse(
+            {
+                "error": "url_required",
+                "detail": (
+                    "Provide {\"url\": \"https://.../webhooks/receive\"} or set "
+                    "SENDBLUE_WEBHOOK_URL"
+                ),
+            },
+            status_code=400,
+        )
+
+    result = _messaging.ensure_receive_webhook(
+        url,
+        global_secret=_settings.sendblue_global_webhook_secret,
+    )
+    status = result.get("status")
+    http_status = 200 if status == "ok" else 502 if status == "error" else 400
+    return JSONResponse(result, status_code=http_status)
 
 
 @app.post("/webhooks/receive")
