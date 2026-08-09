@@ -111,7 +111,7 @@ start_agent() {
   echo "Starting agent (uvicorn app:app --host ${AGENT_HOST} --port ${AGENT_PORT})…"
   (
     cd "${ROOT}"
-    # Don't `source .env` — values with spaces (e.g. SYSTEM_PROMPT) break bash.
+    # Don't `source .env` — values with spaces/special chars can break bash.
     # pydantic-settings loads .env from the working directory.
     nohup "${uvicorn_bin}" app:app --host "${AGENT_HOST}" --port "${AGENT_PORT}" \
       >>"${AGENT_LOG}" 2>&1 &
