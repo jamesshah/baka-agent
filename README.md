@@ -19,20 +19,27 @@ cp .env.example .env
 
 ### `.env`
 
-| Variable | Description |
-|---|---|
-| `SENDBLUE_API_KEY` / `SENDBLUE_API_SECRET` | From [dashboard.sendblue.com](https://dashboard.sendblue.com) |
-| `SENDBLUE_FROM_NUMBER` | Your Sendblue line (E.164, e.g. `+15551234567`) |
-| `SENDBLUE_GLOBAL_WEBHOOK_SECRET` | Must match Sendblue's webhook `globalSecret` (or per-webhook `secret`). Verified via the `sb-signing-secret` header. |
-| `SENDBLUE_WEBHOOK_URL` | Public `https://…/webhooks/receive` URL. On startup the agent checks Sendblue and registers this URL if missing. |
-| `LLAMA_BASE_URL` | OpenAI-compatible base URL (default `http://127.0.0.1:8080/v1`) |
-| `LLAMA_MODEL` | Model id passed to `/chat/completions` (often just `local`) |
-| `ALLOWED_NUMBERS` | Optional comma-separated E.164 allowlist; empty = allow all |
-| `MAX_HISTORY_MESSAGES` / `MAX_AGENT_ITERATIONS` | History trim + tool-call loop cap |
-| `MCP_ENABLED` | Connect MCP servers on startup (default `true`) |
-| `MCP_CONFIG_PATH` | Path to Cursor-style `mcp.json` (default `mcp.json`) |
-| `MCP_OAUTH_DATA_DIR` | Where OAuth tokens are stored (default `.data/mcp-oauth`) |
-| `MCP_OAUTH_OWNER_NUMBER` | Phone that owns SnapTrade tokens (defaults to sole `ALLOWED_NUMBERS` entry) |
+| Variable                                              | Description                                                                                                          |
+| ----------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------- |
+| `SENDBLUE_API_KEY` / `SENDBLUE_API_SECRET`            | From [dashboard.sendblue.com](https://dashboard.sendblue.com)                                                        |
+| `SENDBLUE_FROM_NUMBER`                                | Your Sendblue line (E.164, e.g. `+15551234567`)                                                                      |
+| `SENDBLUE_GLOBAL_WEBHOOK_SECRET`                      | Must match Sendblue's webhook `globalSecret` (or per-webhook `secret`). Verified via the `sb-signing-secret` header. |
+| `SENDBLUE_WEBHOOK_URL`                                | Public `https://…/webhooks/receive` URL. On startup the agent checks Sendblue and registers this URL if missing.     |
+| `LLAMA_BASE_URL`                                      | OpenAI-compatible base URL (default `http://127.0.0.1:8080/v1`)                                                      |
+| `LLAMA_MODEL`                                         | Model id passed to `/chat/completions` (often just `local`)                                                          |
+| `LLAMA_HF_REPO`                                       | GGUF repo for `./run.sh` → `llama-server -hf` (default `unsloth/gemma-4-12b-it-GGUF:UD-Q4_K_XL`)                     |
+| `LLAMA_CACHE`                                         | llama.cpp HF download cache (default: `LLAMA_HF_REPO` without `:quant`; relative → `<project>/.cache/…`)             |
+| `LLAMA_CACHE_RAM`                                     | Host-RAM prompt cache MiB (default `1024`)                                                                           |
+| `LLAMA_CTX_SIZE` / `LLAMA_PARALLEL` / `LLAMA_THREADS` | Context, slots, CPU threads (defaults `16384` / `1` / `8`)                                                           |
+| `LLAMA_BATCH` / `LLAMA_UBATCH`                        | Batch sizes (defaults `1024` / `256`)                                                                                |
+| `LLAMA_N_GPU_LAYERS` / `LLAMA_FIT_TARGET`             | Metal layers + `--fit` free-memory margin MiB (defaults `99` / `4096`)                                               |
+| `LLAMA_PORT` / `AGENT_HOST` / `AGENT_PORT`            | Ports/host used by `./run.sh` (defaults `8080` / `0.0.0.0` / `8000`)                                                 |
+| `ALLOWED_NUMBERS`                                     | Optional comma-separated E.164 allowlist; empty = allow all                                                          |
+| `MAX_HISTORY_MESSAGES` / `MAX_AGENT_ITERATIONS`       | History trim + tool-call loop cap                                                                                    |
+| `MCP_ENABLED`                                         | Connect MCP servers on startup (default `true`)                                                                      |
+| `MCP_CONFIG_PATH`                                     | Path to Cursor-style `mcp.json` (default `mcp.json`)                                                                 |
+| `MCP_OAUTH_DATA_DIR`                                  | Where OAuth tokens are stored (default `.data/mcp-oauth`)                                                            |
+| `MCP_OAUTH_OWNER_NUMBER`                              | Phone that owns SnapTrade tokens (defaults to sole `ALLOWED_NUMBERS` entry)                                          |
 
 On free shared-line Sendblue plans, add the recipient as a contact and have them text your number once to complete verification before messaging works.
 
@@ -50,11 +57,22 @@ chmod +x run.sh   # once
 ./run.sh stop
 ```
 
-Override the Hugging Face model or ports:
+Override the Hugging Face model or ports via `.env` (read by `./run.sh`) or the shell:
 
 ```bash
-LLAMA_HF_REPO=Qwen/Qwen2.5-3B-Instruct-GGUF:Q4_K_M ./run.sh start
+# .env — Gemma 12B on M4 24 GB
+LLAMA_HF_REPO=unsloth/gemma-4-12b-it-GGUF:UD-Q4_K_XL
+LLAMA_CACHE=unsloth/gemma-4-12b-it-GGUF
+LLAMA_CACHE_RAM=1024
+LLAMA_CTX_SIZE=16384
+LLAMA_PARALLEL=1
+LLAMA_THREADS=8
+
+# or one-shot:
+LLAMA_HF_REPO=unsloth/gemma-4-12b-it-GGUF:UD-Q4_K_XL ./run.sh start
 ```
+
+`./run.sh` exports `LLAMA_CACHE`, uses one slot, quantized KV (`q8_0`), Flash Attention, and `--fit-target 4096` (~4 GiB free for other apps). Defaults assume Gemma 12B (~7.4 GB), which leaves more room than Muse 30B. `/health` → `checks.model.prompt_cache` reports cache hit ratio from llama.cpp `/slots`.
 
 PIDs and logs live under `.run/` (gitignored).
 
@@ -123,7 +141,7 @@ Outbound replies are stripped of Markdown and split into ≤2000-character chunk
 
 Inbound messages hit `/webhooks/receive`, which returns `200` immediately and runs the agent in the background. The reply is sent back through Sendblue.
 
-Demo tool: ask *"what time is it?"* — the model can call `get_current_time`.
+Demo tool: ask _"what time is it?"_ — the model can call `get_current_time`.
 
 ## MCP tools
 
@@ -138,34 +156,34 @@ Example with local + remote OAuth (SnapTrade):
 
 ```json
 {
-  "mcpServers": {
-    "filesystem": {
-      "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-filesystem", "."]
-    },
-    "snaptrade": {
-      "url": "https://mcp.snaptrade.com/mcp",
-      "auth": "oauth",
-      "scopes": ["read"]
-    },
-    "remote-api": {
-      "url": "https://example.com/mcp",
-      "headers": {
-        "Authorization": "Bearer ${env:MY_TOKEN}"
-      }
-    }
-  }
+	"mcpServers": {
+		"filesystem": {
+			"command": "npx",
+			"args": ["-y", "@modelcontextprotocol/server-filesystem", "."]
+		},
+		"snaptrade": {
+			"url": "https://mcp.snaptrade.com/mcp",
+			"auth": "oauth",
+			"scopes": ["read"]
+		},
+		"remote-api": {
+			"url": "https://example.com/mcp",
+			"headers": {
+				"Authorization": "Bearer ${env:MY_TOKEN}"
+			}
+		}
+	}
 }
 ```
 
 Supported transports:
 
-| Config | Transport |
-|---|---|
-| `command` + optional `args` / `env` / `cwd` | stdio (local process) |
-| `url` (default) or `"type": "streamableHttp"` | Streamable HTTP |
-| `url` + `"type": "sse"` | SSE |
-| `"auth": "oauth"` on a `url` server | OAuth device-code link (tokens under `MCP_OAUTH_DATA_DIR`) |
+| Config                                        | Transport                                                  |
+| --------------------------------------------- | ---------------------------------------------------------- |
+| `command` + optional `args` / `env` / `cwd`   | stdio (local process)                                      |
+| `url` (default) or `"type": "streamableHttp"` | Streamable HTTP                                            |
+| `url` + `"type": "sse"`                       | SSE                                                        |
+| `"auth": "oauth"` on a `url` server           | OAuth device-code link (tokens under `MCP_OAUTH_DATA_DIR`) |
 
 On startup the client connects to every non-OAuth server, discovers tools, and registers them as `mcp__<server>__<tool>`. OAuth servers (SnapTrade) stay `pending_auth` until linked; if tokens already exist on disk they reconnect automatically with silent refresh — no re-login.
 
@@ -182,17 +200,17 @@ Local helper tools: `link_snaptrade`, `snaptrade_status`, `unlink_snaptrade`. Se
 
 ## Project layout
 
-| Path | Role |
-|---|---|
-| `app.py` | FastAPI: `/health`, `/webhooks/register`, `/webhooks/receive`; wires adapters + MCP lifespan; ensures Sendblue webhook on start |
-| `config.py` | Settings from `.env` |
-| `agents/` | `Agent` ABC + `ChatAgent` (owns `SYSTEM_PROMPT`) |
-| `tools/` | `Tool` ABC, `ToolRegistry`, local tools (time, SnapTrade link/status/unlink) |
-| `mcp_client/` | Cursor-style `mcp.json` loader, multi-server hub, OAuth device flow + token store |
-| `llm/` | `LLMClient` ABC + `LlamaServerAdapter` |
-| `messaging/` | `MessagingClient` ABC + `SendblueAdapter` |
-| `webhooks/` | `SendblueWebhookHandler` (verify + receive + reply) |
-| `mcp.json.example` | Sample MCP server config |
+| Path               | Role                                                                                                                            |
+| ------------------ | ------------------------------------------------------------------------------------------------------------------------------- |
+| `app.py`           | FastAPI: `/health`, `/webhooks/register`, `/webhooks/receive`; wires adapters + MCP lifespan; ensures Sendblue webhook on start |
+| `config.py`        | Settings from `.env`                                                                                                            |
+| `agents/`          | `Agent` ABC + `ChatAgent` (owns `SYSTEM_PROMPT`)                                                                                |
+| `tools/`           | `Tool` ABC, `ToolRegistry`, local tools (time, SnapTrade link/status/unlink)                                                    |
+| `mcp_client/`      | Cursor-style `mcp.json` loader, multi-server hub, OAuth device flow + token store                                               |
+| `llm/`             | `LLMClient` ABC + `LlamaServerAdapter`                                                                                          |
+| `messaging/`       | `MessagingClient` ABC + `SendblueAdapter`                                                                                       |
+| `webhooks/`        | `SendblueWebhookHandler` (verify + receive + reply)                                                                             |
+| `mcp.json.example` | Sample MCP server config                                                                                                        |
 
 ## Notes
 

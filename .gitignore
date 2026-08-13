@@ -11,3 +11,5 @@ __pycache__/
 mcp.json
 .run/
 .data/
+.cache/
+*.gguf

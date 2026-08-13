@@ -58,12 +58,14 @@ class LlamaServerAdapter(LLMClient):
                 }
 
             served = self._fetch_served_model(client)
+            prompt_cache = self._fetch_prompt_cache_stats(client)
             return {
                 "status": "ok",
                 "base_url": self._base_url,
                 "model": self._model,
                 "checked_url": checked_url,
                 **served,
+                **prompt_cache,
             }
 
     def _server_root(self) -> str:
@@ -110,6 +112,102 @@ class LlamaServerAdapter(LLMClient):
             pass
 
         return info
+
+    def _fetch_prompt_cache_stats(self, client: httpx.Client) -> dict[str, Any]:
+        """Aggregate prompt-cache hit ratio from llama-server GET /slots."""
+        slots_url = f"{self._server_root()}/slots"
+        try:
+            response = client.get(slots_url)
+        except httpx.HTTPError as exc:
+            return {
+                "prompt_cache": {
+                    "status": "unavailable",
+                    "detail": f"{slots_url} → {exc}",
+                }
+            }
+
+        if response.status_code != 200:
+            return {
+                "prompt_cache": {
+                    "status": "unavailable",
+                    "detail": f"{slots_url} → HTTP {response.status_code}",
+                }
+            }
+
+        try:
+            slots = response.json()
+        except ValueError:
+            return {
+                "prompt_cache": {
+                    "status": "unavailable",
+                    "detail": "invalid JSON from /slots",
+                }
+            }
+
+        if not isinstance(slots, list):
+            return {
+                "prompt_cache": {
+                    "status": "unavailable",
+                    "detail": "unexpected /slots shape",
+                }
+            }
+
+        cached_total = 0
+        prompt_total = 0
+        per_slot: list[dict[str, Any]] = []
+        for slot in slots:
+            if not isinstance(slot, dict):
+                continue
+            n_cache = slot.get("n_prompt_tokens_cache")
+            n_prompt = slot.get("n_prompt_tokens")
+            n_processed = slot.get("n_prompt_tokens_processed")
+            if n_cache is None and n_prompt is None and n_processed is None:
+                continue
+
+            cache_tokens = int(n_cache or 0)
+            if n_prompt is not None:
+                prompt_tokens = int(n_prompt)
+            else:
+                prompt_tokens = cache_tokens + int(n_processed or 0)
+
+            if prompt_tokens <= 0 and cache_tokens <= 0:
+                continue
+
+            cached_total += cache_tokens
+            prompt_total += prompt_tokens
+            ratio = (
+                round(cache_tokens / prompt_tokens, 4) if prompt_tokens > 0 else None
+            )
+            per_slot.append(
+                {
+                    "id": slot.get("id"),
+                    "n_prompt_tokens_cache": cache_tokens,
+                    "n_prompt_tokens": prompt_tokens,
+                    "cache_hit_ratio": ratio,
+                }
+            )
+
+        if prompt_total <= 0:
+            return {
+                "prompt_cache": {
+                    "status": "ok",
+                    "cache_hit_ratio": None,
+                    "n_prompt_tokens_cache": 0,
+                    "n_prompt_tokens": 0,
+                    "detail": "no prompt token stats yet",
+                    "slots": per_slot,
+                }
+            }
+
+        return {
+            "prompt_cache": {
+                "status": "ok",
+                "cache_hit_ratio": round(cached_total / prompt_total, 4),
+                "n_prompt_tokens_cache": cached_total,
+                "n_prompt_tokens": prompt_total,
+                "slots": per_slot,
+            }
+        }
 
     def _health_urls(self) -> list[str]:
         """Prefer native /health, then OpenAI-compatible /v1/health and /models."""

@@ -8,8 +8,10 @@
 #   ./run.sh status
 #   ./run.sh logs [llama|agent]
 #
-# Optional env overrides (or set in .env — only LLAMA_* / ports below are read here):
+# Optional env overrides (shell env wins over .env; only these keys are read from .env):
 #   LLAMA_HF_REPO   Hugging Face model for llama-server -hf (default below)
+#   LLAMA_CACHE     llama.cpp HF download cache dir (default: LLAMA_HF_REPO sans :quant)
+#   LLAMA_CACHE_RAM host-RAM prompt cache in MiB (default 2048; llama.cpp default is 8192)
 #   LLAMA_PORT      llama-server port (default 8080)
 #   AGENT_HOST      uvicorn host (default 0.0.0.0)
 #   AGENT_PORT      uvicorn port (default 8000)
@@ -24,8 +26,51 @@ AGENT_PID_FILE="${RUN_DIR}/agent.pid"
 LLAMA_LOG="${LOG_DIR}/llama-server.log"
 AGENT_LOG="${LOG_DIR}/agent.log"
 
-# Defaults — override via environment.
+# Load one KEY from .env if unset. Does not `source` the file (avoids bash
+# breaking on spaces/special chars in other values like secrets).
+dotenv_get() {
+  local key="$1"
+  local env_file="${ROOT}/.env"
+  # Already set in the environment — keep it.
+  if [[ -n "${!key+x}" ]]; then
+    return 0
+  fi
+  [[ -f "${env_file}" ]] || return 0
+
+  local line value
+  # Last matching assignment wins (typical dotenv behavior).
+  line="$(grep -E "^[[:space:]]*${key}=" "${env_file}" | tail -n 1)" || true
+  [[ -n "${line}" ]] || return 0
+
+  value="${line#*=}"
+  value="${value%$'\r'}"
+  # Trim surrounding whitespace.
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  # Strip one layer of matching quotes.
+  if [[ "${value}" =~ ^\"(.*)\"$ ]]; then
+    value="${BASH_REMATCH[1]}"
+  elif [[ "${value}" =~ ^\'(.*)\'$ ]]; then
+    value="${BASH_REMATCH[1]}"
+  fi
+
+  printf -v "${key}" '%s' "${value}"
+}
+
+dotenv_get LLAMA_HF_REPO
+dotenv_get LLAMA_CACHE
+dotenv_get LLAMA_CACHE_RAM
+dotenv_get LLAMA_PORT
+dotenv_get AGENT_HOST
+dotenv_get AGENT_PORT
+
+# Defaults when neither shell env nor .env set the value.
 LLAMA_HF_REPO="${LLAMA_HF_REPO:-unsloth/gemma-4-E2B-it-GGUF:BF16}"
+LLAMA_CTX_SIZE="${LLAMA_CTX_SIZE:-100000}"
+# Default download cache = HF repo id without :quant (e.g. unsloth/Muse-Glimmer-30B-GGUF).
+LLAMA_CACHE="${LLAMA_CACHE:-${LLAMA_HF_REPO%%:*}}"
+# 2 GiB is safer on 24 GB unified-memory Macs than llama.cpp's 8 GiB default.
+LLAMA_CACHE_RAM="${LLAMA_CACHE_RAM:-2048}"
 LLAMA_PORT="${LLAMA_PORT:-8080}"
 AGENT_HOST="${AGENT_HOST:-0.0.0.0}"
 AGENT_PORT="${AGENT_PORT:-8000}"
@@ -75,16 +120,36 @@ start_llama() {
     exit 1
   fi
 
+  # Resolve relative LLAMA_CACHE under the project .cache/ so downloads land in a
+  # stable, gitignored place regardless of the caller's cwd.
+  # Default value is the HF repo id (sans :quant), e.g. unsloth/Muse-Glimmer-30B-GGUF.
+  local llama_cache="${LLAMA_CACHE}"
+  if [[ "${llama_cache}" != /* ]]; then
+    if [[ "${llama_cache}" == .cache/* ]]; then
+      llama_cache="${ROOT}/${llama_cache}"
+    else
+      llama_cache="${ROOT}/.cache/${llama_cache}"
+    fi
+  fi
+  mkdir -p "${llama_cache}"
+  export LLAMA_CACHE="${llama_cache}"
+
   echo "Starting llama-server (-hf ${LLAMA_HF_REPO} --port ${LLAMA_PORT})…"
-  # --jinja enables chat templates / tool calling.
+  echo "  LLAMA_CACHE=${LLAMA_CACHE}"
+  # --jinja: chat templates / tool calling.
+  # --cache-prompt: reuse KV for matching prompt prefixes (default on; set explicitly).
+  # --cache-ram: host-RAM prompt-cache budget in MiB (default 8192).
   nohup llama-server \
     -hf "${LLAMA_HF_REPO}" \
     --port "${LLAMA_PORT}" \
-    --ctx-size 100000 \
+    --ctx-size "${LLAMA_CTX_SIZE}" \
     --temp 1.0 \
     --top-p 0.95 \
     --top-k 64 \
     --jinja \
+    --cache-prompt \
+    --cache-ram 8192 \
+    --slots \
     >>"${LLAMA_LOG}" 2>&1 &
   echo $! >"${LLAMA_PID_FILE}"
   echo "  pid $(cat "${LLAMA_PID_FILE}")  log ${LLAMA_LOG}"
@@ -256,8 +321,9 @@ Examples:
   ./run.sh restart llama    # only re-run llama-server
   ./run.sh start            # start both
 
-Optional env overrides:
+Optional env overrides (shell env wins; else .env; else defaults):
   LLAMA_HF_REPO   Hugging Face model for llama-server -hf
+  LLAMA_CACHE     HF download cache dir (default: LLAMA_HF_REPO without :quant)
   LLAMA_PORT      llama-server port (default 8080)
   AGENT_HOST      uvicorn host (default 0.0.0.0)
   AGENT_PORT      uvicorn port (default 8000)
