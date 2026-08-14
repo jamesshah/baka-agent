@@ -7,9 +7,13 @@ from typing import Any
 
 from agents.base import Agent
 from llm.base import LLMClient
+from messaging.media import DownloadedMedia
 from tools.registry import ToolRegistry
 
 logger = logging.getLogger(__name__)
+
+_MEDIA_CHAT_TIMEOUT_S = 300.0
+_DEFAULT_MEDIA_CAPTION = "The user sent this without a caption."
 
 SYSTEM_PROMPT = """
 You are a personal agent the user texts from iMessage. Keep replies concise and conversational. 
@@ -67,57 +71,103 @@ class ChatAgent(Agent):
         else:
             self._histories.pop(session_id, None)
 
-    def run_turn(self, session_id: str, user_text: str) -> str:
+    def has_multimodal(self) -> bool:
+        return self._llm.has_multimodal()
+
+    def supports_media(self, kind: str) -> bool:
+        return self._llm.supports_media(kind)
+
+    def run_turn(
+        self,
+        session_id: str,
+        user_text: str,
+        media: DownloadedMedia | None = None,
+    ) -> str:
         """
         Run one user turn through the agent loop.
 
-        1. Append the user message.
+        1. Append the user message (text, or text + media parts).
         2. Call the LLM (up to max_agent_iterations).
         3. If tool_calls are present, execute them and loop.
         4. Otherwise return the assistant text.
         """
         history = self._get_history(session_id)
-        history.append({"role": "user", "content": user_text})
+        user_message: dict[str, Any] = {
+            "role": "user",
+            "content": _user_content(user_text, media),
+        }
+        history.append(user_message)
         self._trim_history(history)
 
-        for iteration in range(self._max_agent_iterations):
-            logger.info("agent iteration %s for %s", iteration + 1, session_id)
-            tool_specs = self._tools.specs()
-            message = self._llm.chat(history, tools=tool_specs)
+        chat_timeout = _MEDIA_CHAT_TIMEOUT_S if media is not None else None
+        try:
+            for iteration in range(self._max_agent_iterations):
+                logger.info("agent iteration %s for %s", iteration + 1, session_id)
+                tool_specs = self._tools.specs()
+                message = self._llm.chat(
+                    history, tools=tool_specs, timeout=chat_timeout
+                )
 
-            tool_calls = message.get("tool_calls") or []
-            if tool_calls:
-                # Persist the assistant message that requested tools.
-                history.append(message)
-                for call in tool_calls:
-                    fn = call.get("function") or {}
-                    name = fn.get("name") or ""
-                    arguments = fn.get("arguments") or "{}"
-                    call_id = call.get("id") or name
-                    logger.info("tool call: %s(%s)", name, arguments)
-                    result = self._tools.execute(
-                        name, arguments, session_id=session_id
-                    )
-                    history.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": call_id,
-                            "content": result,
-                        }
-                    )
+                tool_calls = message.get("tool_calls") or []
+                if tool_calls:
+                    # Persist the assistant message that requested tools.
+                    history.append(message)
+                    for call in tool_calls:
+                        fn = call.get("function") or {}
+                        name = fn.get("name") or ""
+                        arguments = fn.get("arguments") or "{}"
+                        call_id = call.get("id") or name
+                        logger.info("tool call: %s(%s)", name, arguments)
+                        result = self._tools.execute(
+                            name, arguments, session_id=session_id
+                        )
+                        history.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": call_id,
+                                "content": result,
+                            }
+                        )
+                    self._trim_history(history)
+                    continue
+
+                content = (message.get("content") or "").strip()
+                if not content:
+                    content = "(empty model response)"
+                history.append({"role": "assistant", "content": content})
                 self._trim_history(history)
-                continue
+                return content
 
-            content = (message.get("content") or "").strip()
-            if not content:
-                content = "(empty model response)"
-            history.append({"role": "assistant", "content": content})
-            self._trim_history(history)
-            return content
+            fallback = (
+                "Sorry, I hit my tool-call limit before finishing. "
+                "Try asking again more simply."
+            )
+            history.append({"role": "assistant", "content": fallback})
+            return fallback
+        finally:
+            _collapse_media_message(user_message, user_text, media)
 
-        fallback = (
-            "Sorry, I hit my tool-call limit before finishing. "
-            "Try asking again more simply."
-        )
-        history.append({"role": "assistant", "content": fallback})
-        return fallback
+
+def _user_content(
+    user_text: str,
+    media: DownloadedMedia | None,
+) -> str | list[dict[str, object]]:
+    text = user_text.strip() or (_DEFAULT_MEDIA_CAPTION if media is not None else "")
+    if media is None:
+        return text
+    return [
+        {"type": "text", "text": text},
+        media.to_content_part(),
+    ]
+
+
+def _collapse_media_message(
+    user_message: dict[str, Any],
+    user_text: str,
+    media: DownloadedMedia | None,
+) -> None:
+    if media is None:
+        return
+    caption = user_text.strip()
+    placeholder = f"[{media.kind}]"
+    user_message["content"] = f"{placeholder} {caption}" if caption else placeholder
