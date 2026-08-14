@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hmac
 import logging
+from collections.abc import Iterator
 from typing import Any, Literal
 
 from fastapi import BackgroundTasks, Request
@@ -90,28 +91,29 @@ class SendblueWebhookHandler:
             # Start typing while the local model thinks (iMessage only).
             self._typing(from_number, "start")
 
-            reply = self._run_inbound(from_number, content, media_url)
-            if reply is None:
-                self._typing(from_number, "stop")
-                return
+            for reply in self._iter_inbound(from_number, content, media_url):
+                plain = strip_markdown(reply)
+                chunks = chunk_text(plain)
+                if not chunks:
+                    logger.warning(
+                        "empty reply after format for %s — not sending",
+                        from_number,
+                    )
+                    continue
 
-            plain = strip_markdown(reply)
-            chunks = chunk_text(plain)
-            if not chunks:
-                logger.warning("empty reply after format for %s — not sending", from_number)
-                self._typing(from_number, "stop")
-                return
+                logger.info(
+                    "replying to %s (%d chunk(s)): %s",
+                    from_number,
+                    len(chunks),
+                    chunks[0][:200],
+                )
 
-            logger.info(
-                "replying to %s (%d chunk(s)): %s",
-                from_number,
-                len(chunks),
-                chunks[0][:200],
-            )
+                self._typing(from_number, "stop")
+                for chunk in chunks:
+                    self._messaging.send_message(from_number, chunk)
+                self._typing(from_number, "start")
 
             self._typing(from_number, "stop")
-            for chunk in chunks:
-                self._messaging.send_message(from_number, chunk)
         except Exception:
             logger.exception("failed to process message from %s", from_number)
             self._typing(from_number, "stop")
@@ -122,12 +124,12 @@ class SendblueWebhookHandler:
                     "also failed to send error reply to %s", from_number
                 )
 
-    def _run_inbound(
+    def _iter_inbound(
         self,
         from_number: str,
         content: str,
         media_url: str,
-    ) -> str | None:
+    ) -> Iterator[str]:
         media = None
         if media_url:
             if not self._agent.has_multimodal():
@@ -135,7 +137,8 @@ class SendblueWebhookHandler:
                     "refusing media from %s: model has no multimodal capability",
                     from_number,
                 )
-                return MULTIMODAL_REFUSAL
+                yield MULTIMODAL_REFUSAL
+                return
             try:
                 media = download_media(media_url)
             except UnsupportedAttachment:
@@ -148,10 +151,11 @@ class SendblueWebhookHandler:
                         "ignoring unusable attachment with empty caption from %s",
                         from_number,
                     )
-                    return None
+                    return
             except MediaDownloadError:
                 logger.exception("failed to download media for %s", from_number)
-                return _GENERIC_ERROR
+                yield _GENERIC_ERROR
+                return
             else:
                 if not self._agent.supports_media(media.kind):
                     logger.info(
@@ -160,9 +164,10 @@ class SendblueWebhookHandler:
                         from_number,
                         media.kind,
                     )
-                    return MULTIMODAL_REFUSAL
+                    yield MULTIMODAL_REFUSAL
+                    return
 
-        return self._agent.run_turn(from_number, content, media=media)
+        yield from self._agent.run_turn(from_number, content, media=media)
 
     async def handle_receive(
         self,

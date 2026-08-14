@@ -33,6 +33,7 @@ class McpServerConfig:
     headers: dict[str, str] = field(default_factory=dict)
     auth: AuthKind = "none"
     scopes: list[str] = field(default_factory=list)
+    enabled: bool = True
 
 
 def _resolve_string(value: str, *, workspace: Path) -> str:
@@ -68,6 +69,21 @@ def _resolve_value(value: Any, *, workspace: Path) -> Any:
     return value
 
 
+def _coerce_enabled(name: str, value: Any) -> bool:
+    """Optional per-server flag; default True. JSON false disables the server."""
+    if value is True or value is False:
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"true", "1", "yes"}:
+            return True
+        if lowered in {"false", "0", "no"}:
+            return False
+    raise ValueError(
+        f"Server '{name}': 'enabled' must be a boolean (got {value!r})"
+    )
+
+
 def _detect_transport(raw: dict[str, Any]) -> TransportKind:
     explicit = (raw.get("type") or raw.get("transport") or "").strip().lower()
     if explicit in {"stdio", "sse"}:
@@ -79,7 +95,8 @@ def _detect_transport(raw: dict[str, Any]) -> TransportKind:
         return "streamable_http"
     if raw.get("command"):
         return "stdio"
-    raise ValueError("MCP server config needs either 'command' (stdio) or 'url' (remote)")
+    raise ValueError(
+        "MCP server config needs either 'command' (stdio) or 'url' (remote)")
 
 
 def _detect_auth(raw: dict[str, Any]) -> AuthKind:
@@ -88,13 +105,37 @@ def _detect_auth(raw: dict[str, Any]) -> AuthKind:
         return "oauth"
     if explicit in {"none", ""}:
         return "none"
-    raise ValueError(f"Unknown auth mode '{explicit}' (expected 'none' or 'oauth')")
+    raise ValueError(
+        f"Unknown auth mode '{explicit}' (expected 'none' or 'oauth')")
 
 
-def _parse_server(name: str, raw: dict[str, Any], *, workspace: Path) -> McpServerConfig:
+def _disabled_server(name: str, data: dict[str, Any]) -> McpServerConfig:
+    """Keep a disabled entry for health without requiring a valid transport."""
+    try:
+        transport = _detect_transport(data)
+    except ValueError:
+        transport = "stdio"
+    command = data.get("command")
+    url = data.get("url")
+    return McpServerConfig(
+        name=name,
+        transport=transport,
+        command=command if isinstance(command, str) else None,
+        url=url if isinstance(url, str) else None,
+        enabled=False,
+    )
+
+
+def _parse_server(
+    name: str, raw: dict[str, Any], *, workspace: Path
+) -> McpServerConfig:
     data = _resolve_value(raw, workspace=workspace)
     if not isinstance(data, dict):
         raise ValueError(f"Server '{name}' config must be an object")
+
+    enabled = _coerce_enabled(name, data.get("enabled", True))
+    if not enabled:
+        return _disabled_server(name, data)
 
     transport = _detect_transport(data)
     auth = _detect_auth(data)
@@ -117,12 +158,15 @@ def _parse_server(name: str, raw: dict[str, Any], *, workspace: Path) -> McpServ
 
     if transport == "stdio":
         if not command or not isinstance(command, str):
-            raise ValueError(f"Server '{name}': stdio transport requires 'command'")
+            raise ValueError(
+                f"Server '{name}': stdio transport requires 'command'")
         if auth == "oauth":
-            raise ValueError(f"Server '{name}': oauth auth requires a remote 'url' transport")
+            raise ValueError(
+                f"Server '{name}': oauth auth requires a remote 'url' transport")
     else:
         if not url or not isinstance(url, str):
-            raise ValueError(f"Server '{name}': remote transport requires 'url'")
+            raise ValueError(
+                f"Server '{name}': remote transport requires 'url'")
 
     scopes = [str(s) for s in scopes_raw]
     if auth == "oauth" and not scopes:
@@ -139,6 +183,7 @@ def _parse_server(name: str, raw: dict[str, Any], *, workspace: Path) -> McpServ
         headers={str(k): str(v) for k, v in headers.items()},
         auth=auth,
         scopes=scopes,
+        enabled=True,
     )
 
 
@@ -155,7 +200,8 @@ def load_mcp_config(
         "mcpServers": {
           "server-name": { "command": "...", "args": [...], "env": {...} },
           "remote": { "url": "https://...", "headers": {...} },
-          "snaptrade": { "url": "https://mcp.snaptrade.com/mcp", "auth": "oauth" }
+          "snaptrade": { "url": "https://mcp.snaptrade.com/mcp", "auth": "oauth" },
+          "optional": { "enabled": false, "url": "https://example.com/mcp" }
         }
       }
     """
@@ -179,10 +225,27 @@ def load_mcp_config(
         raise ValueError(f"'mcpServers' must be an object: {config_path}")
 
     servers: dict[str, McpServerConfig] = {}
+    disabled: list[str] = []
     for name, raw in servers_raw.items():
         if not isinstance(raw, dict):
             raise ValueError(f"Server '{name}' config must be an object")
-        servers[name] = _parse_server(str(name), raw, workspace=workspace_path)
+        parsed = _parse_server(str(name), raw, workspace=workspace_path)
+        servers[parsed.name] = parsed
+        if not parsed.enabled:
+            disabled.append(parsed.name)
+            logger.info(
+                "MCP server '%s' is disabled (enabled: false) — not connecting",
+                parsed.name,
+            )
 
-    logger.info("Loaded %d MCP server(s) from %s", len(servers), config_path)
+    if disabled:
+        logger.info(
+            "Loaded %d MCP server(s) from %s (%d disabled: %s)",
+            len(servers),
+            config_path,
+            len(disabled),
+            ", ".join(disabled),
+        )
+    else:
+        logger.info("Loaded %d MCP server(s) from %s", len(servers), config_path)
     return servers

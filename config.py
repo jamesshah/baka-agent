@@ -25,6 +25,7 @@ class Settings(BaseSettings):
 
     max_history_messages: int = 40
     max_agent_iterations: int = 5
+    max_executor_iterations: int = 8
 
     # Cursor-compatible MCP config (mcpServers in a JSON file).
     mcp_config_path: str = "mcp.json"

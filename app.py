@@ -9,7 +9,7 @@ from typing import Any, AsyncIterator
 from fastapi import BackgroundTasks, FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from agents import ChatAgent
+from agents import ChatAgent, ExecutorAgent
 from config import get_settings
 from llm import LlamaServerAdapter
 from mcp_client import MultiServerMcpClient, load_mcp_config
@@ -18,7 +18,9 @@ from messaging import SendblueAdapter
 from tools import (
     GetCurrentTimeTool,
     LinkSnaptradeTool,
+    SendAcknowledgementTool,
     SnaptradeStatusTool,
+    SpawnAgentTool,
     ToolRegistry,
     UnlinkSnaptradeTool,
 )
@@ -36,8 +38,17 @@ _llm = LlamaServerAdapter(
     model=_settings.llama_model,
 )
 _tools = ToolRegistry()
-_tools.register(GetCurrentTimeTool())
 _mcp: MultiServerMcpClient | None = None
+_executor = ExecutorAgent(
+    llm=_llm,
+    tools=_tools,
+    max_agent_iterations=_settings.max_executor_iterations,
+)
+
+_tools.register(GetCurrentTimeTool())
+_tools.register(SendAcknowledgementTool())
+_tools.register(SpawnAgentTool(_executor))
+
 _agent = ChatAgent(
     llm=_llm,
     tools=_tools,
@@ -74,7 +85,8 @@ def _on_mcp_linked(server: str, phone: str) -> None:
     try:
         _messaging.send_message(phone, message)
     except Exception:  # noqa: BLE001
-        logger.exception("Failed to send %s linked confirmation to %s", server, phone)
+        logger.exception(
+            "Failed to send %s linked confirmation to %s", server, phone)
 
 
 def _register_oauth_local_tools(client: MultiServerMcpClient) -> None:
@@ -114,6 +126,7 @@ def _mcp_health() -> dict[str, Any]:
         return {
             "status": "disabled",
             "configured": [],
+            "disabled": [],
             "connected": [],
             "pending_auth": [],
             "tool_count": 0,
@@ -123,6 +136,7 @@ def _mcp_health() -> dict[str, Any]:
         return {
             "status": "disabled",
             "configured": [],
+            "disabled": [],
             "connected": [],
             "pending_auth": [],
             "tool_count": 0,
@@ -176,14 +190,40 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 app = FastAPI(title="baka-agent", version="0.1.0", lifespan=lifespan)
 
 
+def _agents_health() -> dict[str, Any]:
+    chat_names = _tools.names(chat_agent=True)
+    executor_names = _tools.names(chat_agent=False)
+    executor_local = _tools.local_names(chat_agent=False)
+    chat_ok = bool(chat_names)
+    executor_ok = bool(executor_names)
+    if chat_ok and executor_ok:
+        status = "ok"
+    else:
+        status = "error"
+    return {
+        "status": status,
+        "chat": {
+            "class": "ChatAgent",
+            "role": "user-facing",
+            "status": "ok" if chat_ok else "error",
+            "tool_count": len(chat_names),
+            "tools": chat_names,
+        },
+        "executor": {
+            "class": "ExecutorAgent",
+            "role": "worker",
+            "status": "ok" if executor_ok else "error",
+            "tool_count": len(executor_names),
+            "local_tool_count": len(executor_local),
+            "granted": "per spawn",
+            "tools": executor_names,
+        },
+    }
+
+
 @app.get("/health")
 def health() -> JSONResponse:
-    local_names = _tools.local_names()
-    tools_check = {
-        "status": "ok" if local_names else "error",
-        "count": len(local_names),
-        "names": local_names,
-    }
+    agents_check = _agents_health()
     mcp_check = _mcp_health()
     model_check = _llm.health_check()
     webhook_check = _messaging.webhook_health_check(
@@ -192,7 +232,7 @@ def health() -> JSONResponse:
     )
 
     checks = {
-        "tools": tools_check,
+        "agents": agents_check,
         "mcp": mcp_check,
         "model": model_check,
         "sendblue_webhook": webhook_check,
