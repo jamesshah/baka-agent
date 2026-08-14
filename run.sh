@@ -70,7 +70,7 @@ LLAMA_CTX_SIZE="${LLAMA_CTX_SIZE:-100000}"
 # Default download cache = HF repo id without :quant (e.g. unsloth/Muse-Glimmer-30B-GGUF).
 LLAMA_CACHE="${LLAMA_CACHE:-${LLAMA_HF_REPO%%:*}}"
 # 2 GiB is safer on 24 GB unified-memory Macs than llama.cpp's 8 GiB default.
-LLAMA_CACHE_RAM="${LLAMA_CACHE_RAM:-2048}"
+LLAMA_CACHE_RAM="${LLAMA_CACHE_RAM:-1024}"
 LLAMA_PORT="${LLAMA_PORT:-8080}"
 AGENT_HOST="${AGENT_HOST:-0.0.0.0}"
 AGENT_PORT="${AGENT_PORT:-8000}"
@@ -148,7 +148,7 @@ start_llama() {
     --top-k 64 \
     --jinja \
     --cache-prompt \
-    --cache-ram 8192 \
+    --cache-ram "${LLAMA_CACHE_RAM}" \
     --slots \
     >>"${LLAMA_LOG}" 2>&1 &
   echo $! >"${LLAMA_PID_FILE}"
