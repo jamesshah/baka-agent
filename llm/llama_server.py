@@ -2,12 +2,18 @@
 
 from __future__ import annotations
 
+import logging
+import time
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 
 from llm.base import LLMClient
+
+logger = logging.getLogger(__name__)
+
+_MODALITIES_TTL_S = 60.0
 
 
 class LlamaServerAdapter(LLMClient):
@@ -23,6 +29,8 @@ class LlamaServerAdapter(LLMClient):
         self._base_url = base_url.rstrip("/")
         self._model = model
         self._timeout = timeout
+        self._modalities: set[str] | None = None
+        self._modalities_fetched_at = 0.0
 
     @property
     def base_url(self) -> str:
@@ -59,11 +67,15 @@ class LlamaServerAdapter(LLMClient):
 
             served = self._fetch_served_model(client)
             prompt_cache = self._fetch_prompt_cache_stats(client)
+            modalities_set = self._modalities_from_payloads(client, served)
+            self._modalities = modalities_set
+            self._modalities_fetched_at = time.monotonic()
             return {
                 "status": "ok",
                 "base_url": self._base_url,
                 "model": self._model,
                 "checked_url": checked_url,
+                "input_modalities": sorted(modalities_set),
                 **served,
                 **prompt_cache,
             }
@@ -95,7 +107,8 @@ class LlamaServerAdapter(LLMClient):
                 elif data.get("models"):
                     first = data["models"][0]
                     if isinstance(first, dict):
-                        info["served_model"] = first.get("name") or first.get("model")
+                        info["served_model"] = first.get(
+                            "name") or first.get("model")
         except (httpx.HTTPError, ValueError, TypeError):
             pass
 
@@ -176,7 +189,8 @@ class LlamaServerAdapter(LLMClient):
             cached_total += cache_tokens
             prompt_total += prompt_tokens
             ratio = (
-                round(cache_tokens / prompt_tokens, 4) if prompt_tokens > 0 else None
+                round(cache_tokens / prompt_tokens,
+                      4) if prompt_tokens > 0 else None
             )
             per_slot.append(
                 {
@@ -226,11 +240,56 @@ class LlamaServerAdapter(LLMClient):
                 unique.append(url)
         return unique
 
+    def input_modalities(self) -> set[str]:
+        now = time.monotonic()
+        if (
+            self._modalities is not None
+            and (now - self._modalities_fetched_at) < _MODALITIES_TTL_S
+        ):
+            return self._modalities
+        try:
+            with httpx.Client(timeout=5.0) as client:
+                modalities = self._modalities_from_payloads(client)
+        except (httpx.HTTPError, ValueError, TypeError):
+            logger.exception("failed to probe llama-server modalities")
+            modalities = set()
+        self._modalities = modalities
+        self._modalities_fetched_at = now
+        logger.info("llama-server input modalities: %s",
+                    sorted(modalities) or "none")
+        return modalities
+
+    def _modalities_from_payloads(
+        self,
+        client: httpx.Client,
+        served: dict[str, Any] | None = None,
+    ) -> set[str]:
+        models_payload = self._get_json(client, f"{self._base_url}/models")
+        props_payload = self._get_json(client, f"{self._server_root()}/props")
+        modalities = _parse_input_modalities(
+            models_payload,
+            props_payload,
+            configured_model=self._model,
+            served_model=(served or {}).get("served_model"),
+        )
+        return modalities
+
+    def _get_json(self, client: httpx.Client, url: str) -> dict[str, Any] | None:
+        try:
+            response = client.get(url)
+            if response.status_code != 200:
+                return None
+            data = response.json()
+        except (httpx.HTTPError, ValueError, TypeError):
+            return None
+        return data if isinstance(data, dict) else None
+
     def chat(
         self,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
         temperature: float = 0.7,
+        timeout: float | None = None,
     ) -> dict[str, Any]:
         url = f"{self._base_url}/chat/completions"
         payload: dict[str, Any] = {
@@ -241,7 +300,7 @@ class LlamaServerAdapter(LLMClient):
         if tools:
             payload["tools"] = tools
 
-        with httpx.Client(timeout=self._timeout) as client:
+        with httpx.Client(timeout=timeout if timeout is not None else self._timeout) as client:
             response = client.post(url, json=payload)
             response.raise_for_status()
             data = response.json()
@@ -253,3 +312,120 @@ class LlamaServerAdapter(LLMClient):
         if not isinstance(message, dict):
             raise RuntimeError(f"LLM returned invalid message: {data}")
         return message
+
+
+def _parse_input_modalities(
+    models_payload: dict[str, Any] | None,
+    props_payload: dict[str, Any] | None,
+    *,
+    configured_model: str,
+    served_model: str | None,
+) -> set[str]:
+    """Read image/audio/video support from /v1/models, then /props."""
+    entry = _pick_model_entry(models_payload, configured_model, served_model)
+    from_arch = _modalities_from_architecture(entry) if entry else set()
+    if not from_arch:
+        from_arch = _architecture_from_payload(models_payload)
+    if from_arch:
+        return from_arch
+
+    has_mm = _payload_has_multimodal_capability(models_payload)
+    from_props = _modalities_from_props(props_payload)
+    if has_mm:
+        if from_props is not None:
+            return from_props
+        return {"image"}
+    # OpenAI ``data[]`` often omits capabilities; /props still lists vision/audio.
+    if from_props:
+        return from_props
+    return set()
+
+
+def _iter_model_entries(models_payload: dict[str, Any] | None) -> list[dict[str, Any]]:
+    if not models_payload:
+        return []
+    entries: list[dict[str, Any]] = []
+    for key in ("data", "models"):
+        raw = models_payload.get(key)
+        if not isinstance(raw, list):
+            continue
+        entries.extend(e for e in raw if isinstance(e, dict))
+    return entries
+
+
+def _pick_model_entry(
+    models_payload: dict[str, Any] | None,
+    configured_model: str,
+    served_model: str | None,
+) -> dict[str, Any] | None:
+    dict_entries = _iter_model_entries(models_payload)
+    if not dict_entries:
+        return None
+
+    wanted = {n for n in (configured_model, served_model) if n}
+    for entry in dict_entries:
+        identity = entry.get("id") or entry.get("name") or entry.get("model")
+        if identity in wanted:
+            return entry
+    return dict_entries[0]
+
+
+def _modalities_from_architecture(entry: dict[str, Any]) -> set[str]:
+    arch = entry.get("architecture")
+    if not isinstance(arch, dict):
+        return set()
+    raw = arch.get("input_modalities")
+    if not isinstance(raw, list) or not raw:
+        return set()
+    return _normalize_modality_names(raw)
+
+
+def _architecture_from_payload(models_payload: dict[str, Any] | None) -> set[str]:
+    for entry in _iter_model_entries(models_payload):
+        found = _modalities_from_architecture(entry)
+        if found:
+            return found
+    return set()
+
+
+def _has_multimodal_capability(entry: dict[str, Any]) -> bool:
+    caps = entry.get("capabilities")
+    if not isinstance(caps, list):
+        return False
+    return any(isinstance(c, str) and c.lower() == "multimodal" for c in caps)
+
+
+def _payload_has_multimodal_capability(models_payload: dict[str, Any] | None) -> bool:
+    return any(_has_multimodal_capability(entry) for entry in _iter_model_entries(models_payload))
+
+
+def _modalities_from_props(props_payload: dict[str, Any] | None) -> set[str] | None:
+    """Map /props.modalities to image/audio/video. None means the field was absent."""
+    if not props_payload:
+        return None
+    raw = props_payload.get("modalities")
+    if not isinstance(raw, dict) or not raw:
+        return None
+    result: set[str] = set()
+    if raw.get("vision") or raw.get("image"):
+        result.add("image")
+    if raw.get("audio"):
+        result.add("audio")
+    if raw.get("video"):
+        result.add("video")
+    return result
+
+
+def _normalize_modality_names(raw: list[Any]) -> set[str]:
+    result: set[str] = set()
+    for item in raw:
+        if not isinstance(item, str):
+            continue
+        name = item.strip().lower()
+        if name in {"image", "vision"}:
+            result.add("image")
+        elif name == "audio":
+            result.add("audio")
+        elif name == "video":
+            result.add("video")
+    return result

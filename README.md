@@ -141,6 +141,8 @@ Outbound replies are stripped of Markdown and split into ≤2000-character chunk
 
 Inbound messages hit `/webhooks/receive`, which returns `200` immediately and runs the agent in the background. The reply is sent back through Sendblue.
 
+Photos, audio, and video attachments are downloaded from Sendblue and sent to the model when llama-server advertises that modality (`GET /v1/models`). Otherwise the agent replies: `I don't have multi-modal capabilities.`
+
 Demo tool: ask _"what time is it?"_ — the model can call `get_current_time`.
 
 ## MCP tools

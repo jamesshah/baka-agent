@@ -13,11 +13,18 @@ from agents.base import Agent
 from config import get_settings
 from messaging.base import MessagingClient
 from messaging.format import chunk_text, strip_markdown
+from messaging.media import (
+    MULTIMODAL_REFUSAL,
+    MediaDownloadError,
+    UnsupportedAttachment,
+    download_media,
+)
 
 logger = logging.getLogger(__name__)
 
 # Header Sendblue sends when a webhook / global secret is configured.
 _SENDBLUE_SIGNING_HEADER = "sb-signing-secret"
+_GENERIC_ERROR = "Sorry, something went wrong processing your message."
 
 
 class SendblueWebhookHandler:
@@ -72,13 +79,22 @@ class SendblueWebhookHandler:
         except Exception:
             logger.exception("typing indicator %s failed for %s", state, number)
 
-    def process_inbound(self, from_number: str, content: str) -> None:
+    def process_inbound(
+        self,
+        from_number: str,
+        content: str,
+        media_url: str = "",
+    ) -> None:
         """Run the agent and reply via messaging (background)."""
         try:
             # Start typing while the local model thinks (iMessage only).
             self._typing(from_number, "start")
 
-            reply = self._agent.run_turn(from_number, content)
+            reply = self._run_inbound(from_number, content, media_url)
+            if reply is None:
+                self._typing(from_number, "stop")
+                return
+
             plain = strip_markdown(reply)
             chunks = chunk_text(plain)
             if not chunks:
@@ -100,14 +116,53 @@ class SendblueWebhookHandler:
             logger.exception("failed to process message from %s", from_number)
             self._typing(from_number, "stop")
             try:
-                self._messaging.send_message(
-                    from_number,
-                    "Sorry, something went wrong processing your message.",
-                )
+                self._messaging.send_message(from_number, _GENERIC_ERROR)
             except Exception:
                 logger.exception(
                     "also failed to send error reply to %s", from_number
                 )
+
+    def _run_inbound(
+        self,
+        from_number: str,
+        content: str,
+        media_url: str,
+    ) -> str | None:
+        media = None
+        if media_url:
+            if not self._agent.has_multimodal():
+                logger.info(
+                    "refusing media from %s: model has no multimodal capability",
+                    from_number,
+                )
+                return MULTIMODAL_REFUSAL
+            try:
+                media = download_media(media_url)
+            except UnsupportedAttachment:
+                logger.info(
+                    "non-media attachment from %s — using caption only",
+                    from_number,
+                )
+                if not content:
+                    logger.info(
+                        "ignoring unusable attachment with empty caption from %s",
+                        from_number,
+                    )
+                    return None
+            except MediaDownloadError:
+                logger.exception("failed to download media for %s", from_number)
+                return _GENERIC_ERROR
+            else:
+                if not self._agent.supports_media(media.kind):
+                    logger.info(
+                        "refusing %s from %s: model lacks %s input",
+                        media.kind,
+                        from_number,
+                        media.kind,
+                    )
+                    return MULTIMODAL_REFUSAL
+
+        return self._agent.run_turn(from_number, content, media=media)
 
     async def handle_receive(
         self,
@@ -134,6 +189,7 @@ class SendblueWebhookHandler:
             return JSONResponse({"received": True, "ignored": "outbound"})
 
         content = (body.get("content") or "").strip()
+        media_url = (body.get("media_url") or "").strip()
         from_number = (
             body.get("from_number") or body.get("number") or ""
         ).strip()
@@ -142,7 +198,7 @@ class SendblueWebhookHandler:
             logger.warning("webhook missing from_number: %s", body)
             return JSONResponse({"received": True, "ignored": "no_from_number"})
 
-        if not content:
+        if not content and not media_url:
             logger.info("empty content from %s — ignoring", from_number)
             return JSONResponse({"received": True, "ignored": "empty_content"})
 
@@ -153,11 +209,12 @@ class SendblueWebhookHandler:
             return JSONResponse({"received": True, "ignored": "not_allowed"})
 
         service = (body.get("service") or "").strip()
+        preview = content[:200] if content else f"[media] {media_url[:120]}"
         logger.info(
             "inbound from %s service=%s: %s",
             from_number,
             service or "unknown",
-            content[:200],
+            preview,
         )
         if service and service.lower() != "imessage":
             logger.warning(
@@ -165,5 +222,7 @@ class SendblueWebhookHandler:
                 service,
             )
 
-        background_tasks.add_task(self.process_inbound, from_number, content)
+        background_tasks.add_task(
+            self.process_inbound, from_number, content, media_url
+        )
         return JSONResponse({"received": True})
