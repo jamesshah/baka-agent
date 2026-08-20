@@ -8,6 +8,10 @@
       "url": "https://mcp.snaptrade.com/mcp",
       "auth": "oauth",
       "scopes": ["read"]
+    },
+    "optional-remote": {
+      "enabled": false,
+      "url": "https://example.com/mcp"
     }
   }
 }

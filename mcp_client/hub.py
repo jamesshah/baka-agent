@@ -95,17 +95,21 @@ class MultiServerMcpClient:
         return self._oauth_owner_phone
 
     def oauth_server_names(self) -> list[str]:
-        return sorted(n for n, c in self._servers.items() if c.auth == "oauth")
+        return sorted(
+            n for n, c in self._servers.items() if c.auth == "oauth" and c.enabled
+        )
 
     def has_server(self, name: str) -> bool:
-        return name in self._servers
+        config = self._servers.get(name)
+        return config is not None and config.enabled
 
     def server_config(self, name: str) -> McpServerConfig | None:
         return self._servers.get(name)
 
     def status(self) -> dict[str, Any]:
         """Snapshot of configured vs connected MCP servers and tools."""
-        configured = sorted(self._servers)
+        configured = sorted(n for n, c in self._servers.items() if c.enabled)
+        disabled = sorted(n for n, c in self._servers.items() if not c.enabled)
         connected = sorted(self._sessions)
         pending = sorted(self._pending_auth)
         running = self._loop is not None and self._loop.is_running()
@@ -123,6 +127,7 @@ class MultiServerMcpClient:
             "status": overall,
             "running": running,
             "configured": configured,
+            "disabled": disabled,
             "connected": connected,
             "pending_auth": pending,
             "tool_count": len(self._tools),
@@ -130,7 +135,7 @@ class MultiServerMcpClient:
 
     def start(self, timeout: float = 60.0) -> None:
         """Spawn the background loop, connect servers, and discover tools."""
-        if not self._servers:
+        if not any(config.enabled for config in self._servers.values()):
             logger.info("No MCP servers configured")
             return
         if self._thread is not None:
@@ -216,6 +221,8 @@ class MultiServerMcpClient:
         config = self._servers.get(server)
         if config is None:
             return {"status": "unknown_server", "server": server}
+        if not config.enabled:
+            return {"status": "disabled", "server": server}
         if config.auth != "oauth":
             return {
                 "status": "connected" if server in self._sessions else "configured",
@@ -277,6 +284,11 @@ class MultiServerMcpClient:
         self._shutdown = asyncio.Event()
         try:
             for name, config in self._servers.items():
+                if not config.enabled:
+                    logger.info(
+                        "MCP server '%s' is disabled — not connecting", name
+                    )
+                    continue
                 try:
                     await self._maybe_connect_on_startup(name, config)
                 except Exception:  # noqa: BLE001 — keep other servers alive
@@ -335,6 +347,9 @@ class MultiServerMcpClient:
 
     async def _connect_named(self, name: str, *, phone: str = "") -> None:
         config = self._servers[name]
+        if not config.enabled:
+            logger.info("MCP server '%s' is disabled — not connecting", name)
+            return
         if name in self._sessions:
             return
 
@@ -430,6 +445,8 @@ class MultiServerMcpClient:
         config = self._servers.get(server)
         if config is None:
             raise KeyError(f"Unknown MCP server: {server}")
+        if not config.enabled:
+            raise RuntimeError(f"Server '{server}' is disabled")
         if config.auth != "oauth" or not config.url:
             raise RuntimeError(f"Server '{server}' is not configured for OAuth")
 

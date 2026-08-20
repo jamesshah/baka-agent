@@ -17,6 +17,14 @@ class Tool(ABC):
     def execute(self, **kwargs: Any) -> Any:
         """Run the tool with keyword arguments from the model."""
 
+    def is_enabled(self) -> bool:
+        """True if the tool is enabled."""
+        return True
+
+    def is_chat_agent_tool(self) -> bool:
+        """True if the tool is exposed to the user-facing ChatAgent."""
+        return False
+
     def to_openai_spec(self) -> dict[str, Any]:
         """Build an OpenAI-style function tool schema."""
         return {
