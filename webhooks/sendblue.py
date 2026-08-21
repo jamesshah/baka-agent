@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import hmac
 import logging
-from collections.abc import Iterator
+import threading
+from collections import OrderedDict
+from collections.abc import Callable, Iterator
 from typing import Any, Literal
 
 from fastapi import BackgroundTasks, Request
@@ -26,6 +28,70 @@ logger = logging.getLogger(__name__)
 # Header Sendblue sends when a webhook / global secret is configured.
 _SENDBLUE_SIGNING_HEADER = "sb-signing-secret"
 _GENERIC_ERROR = "Sorry, something went wrong processing your message."
+_TYPING_PULSE_INTERVAL_S = 5.0
+_SEEN_HANDLE_MAX = 10_000
+
+
+class _TypingPulse:
+    """Resend iMessage typing ``start`` on an interval until ``stop``."""
+
+    def __init__(
+        self,
+        emit: Callable[[Literal["start", "stop"]], None],
+        *,
+        interval: float = _TYPING_PULSE_INTERVAL_S,
+    ) -> None:
+        self._emit = emit
+        self._interval = interval
+        self._stop = threading.Event()
+        self._lock = threading.Lock()
+        self._active = False
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        with self._lock:
+            if self._thread is not None and self._thread.is_alive():
+                return
+            self._active = True
+            self._stop.clear()
+            thread = threading.Thread(
+                target=self._run,
+                name="sendblue-typing-pulse",
+                daemon=True,
+            )
+            self._thread = thread
+        thread.start()
+
+    def stop(self) -> None:
+        thread: threading.Thread | None
+        with self._lock:
+            self._active = False
+            thread = self._thread
+            self._thread = None
+            self._stop.set()
+        if thread is not None:
+            thread.join(timeout=self._interval + 1.0)
+        with self._lock:
+            self._emit("stop")
+
+    def __enter__(self) -> _TypingPulse:
+        self.start()
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.stop()
+
+    def _emit_start(self) -> None:
+        with self._lock:
+            if not self._active:
+                return
+        self._emit("start")
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            self._emit_start()
+            if self._stop.wait(self._interval):
+                break
 
 
 class SendblueWebhookHandler:
@@ -34,6 +100,8 @@ class SendblueWebhookHandler:
     def __init__(self, agent: Agent, messaging: MessagingClient) -> None:
         self._agent = agent
         self._messaging = messaging
+        self._seen_handles: OrderedDict[str, None] = OrderedDict()
+        self._seen_lock = threading.Lock()
 
     def verify_secret(self, request: Request) -> JSONResponse | None:
         """
@@ -63,6 +131,18 @@ class SendblueWebhookHandler:
             return JSONResponse({"error": "unauthorized"}, status_code=401)
         return None
 
+    def _is_duplicate_handle(self, message_handle: str) -> bool:
+        """Claim ``message_handle``; return True if it was already processed."""
+        if not message_handle:
+            return False
+        with self._seen_lock:
+            if message_handle in self._seen_handles:
+                return True
+            self._seen_handles[message_handle] = None
+            while len(self._seen_handles) > _SEEN_HANDLE_MAX:
+                self._seen_handles.popitem(last=False)
+            return False
+
     def _typing(
         self, number: str, state: Literal["start", "stop"]
     ) -> None:
@@ -78,7 +158,8 @@ class SendblueWebhookHandler:
                     getattr(resp, "error_message", None),
                 )
         except Exception:
-            logger.exception("typing indicator %s failed for %s", state, number)
+            logger.exception(
+                "typing indicator %s failed for %s", state, number)
 
     def process_inbound(
         self,
@@ -87,36 +168,32 @@ class SendblueWebhookHandler:
         media_url: str = "",
     ) -> None:
         """Run the agent and reply via messaging (background)."""
+        pulse = _TypingPulse(lambda state: self._typing(from_number, state))
         try:
-            # Start typing while the local model thinks (iMessage only).
-            self._typing(from_number, "start")
+            with pulse:
+                for reply in self._iter_inbound(from_number, content, media_url):
+                    plain = strip_markdown(reply)
+                    chunks = chunk_text(plain)
+                    if not chunks:
+                        logger.warning(
+                            "empty reply after format for %s — not sending",
+                            from_number,
+                        )
+                        continue
 
-            for reply in self._iter_inbound(from_number, content, media_url):
-                plain = strip_markdown(reply)
-                chunks = chunk_text(plain)
-                if not chunks:
-                    logger.warning(
-                        "empty reply after format for %s — not sending",
+                    logger.info(
+                        "replying to %s (%d chunk(s)): %s",
                         from_number,
+                        len(chunks),
+                        chunks[0][:200],
                     )
-                    continue
 
-                logger.info(
-                    "replying to %s (%d chunk(s)): %s",
-                    from_number,
-                    len(chunks),
-                    chunks[0][:200],
-                )
-
-                self._typing(from_number, "stop")
-                for chunk in chunks:
-                    self._messaging.send_message(from_number, chunk)
-                self._typing(from_number, "start")
-
-            self._typing(from_number, "stop")
+                    pulse.stop()
+                    for chunk in chunks:
+                        self._messaging.send_message(from_number, chunk)
+                    pulse.start()
         except Exception:
             logger.exception("failed to process message from %s", from_number)
-            self._typing(from_number, "stop")
             try:
                 self._messaging.send_message(from_number, _GENERIC_ERROR)
             except Exception:
@@ -153,7 +230,8 @@ class SendblueWebhookHandler:
                     )
                     return
             except MediaDownloadError:
-                logger.exception("failed to download media for %s", from_number)
+                logger.exception(
+                    "failed to download media for %s", from_number)
                 yield _GENERIC_ERROR
                 return
             else:
@@ -177,8 +255,9 @@ class SendblueWebhookHandler:
         """
         Sendblue inbound-message webhook.
 
-        Always returns 200 quickly so Sendblue does not retry. Agent work
-        (and the outbound reply) runs in a background task.
+        Always returns 200 quickly so Sendblue does not retry. Duplicate
+        ``message_handle`` deliveries are ignored. Agent work (and the
+        outbound reply) runs in a background task.
         """
         auth_error = self.verify_secret(request)
         if auth_error is not None:
@@ -213,11 +292,26 @@ class SendblueWebhookHandler:
             logger.info("number %s not in allowlist — ignoring", from_number)
             return JSONResponse({"received": True, "ignored": "not_allowed"})
 
+        message_handle = (body.get("message_handle") or "").strip()
+        if not message_handle:
+            logger.warning(
+                "webhook missing message_handle from %s — cannot dedupe",
+                from_number,
+            )
+        elif self._is_duplicate_handle(message_handle):
+            logger.info(
+                "duplicate message_handle %s from %s — ignoring",
+                message_handle,
+                from_number,
+            )
+            return JSONResponse({"received": True, "ignored": "duplicate"})
+
         service = (body.get("service") or "").strip()
         preview = content[:200] if content else f"[media] {media_url[:120]}"
         logger.info(
-            "inbound from %s service=%s: %s",
+            "inbound from %s handle=%s service=%s: %s",
             from_number,
+            message_handle or "-",
             service or "unknown",
             preview,
         )
