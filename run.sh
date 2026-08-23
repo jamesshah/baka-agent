@@ -58,6 +58,7 @@ dotenv_get() {
 }
 
 dotenv_get LLAMA_HF_REPO
+dotenv_get LLAMA_CTX_SIZE
 dotenv_get LLAMA_CACHE
 dotenv_get LLAMA_CACHE_RAM
 dotenv_get LLAMA_PORT
@@ -148,6 +149,10 @@ start_llama() {
     --top-k 64 \
     --jinja \
     --cache-prompt \
+    -fa 1 \
+    -ngl 99 \
+    -ctk q8_0 \
+    -ctv q8_0 \
     --cache-ram "${LLAMA_CACHE_RAM}" \
     --slots \
     >>"${LLAMA_LOG}" 2>&1 &
