@@ -9,6 +9,7 @@ from typing import Any
 
 from llm.base import LLMClient
 from tools.registry import ToolRegistry
+from tools.session_context import reset_session_id, set_session_id
 
 logger = logging.getLogger(__name__)
 
@@ -48,61 +49,65 @@ def run_tool_loop(
     ``turn_id`` is stored on history messages and stripped before LLM calls.
     """
     specs = tool_specs if tool_specs is not None else tools.specs()
-    for iteration in range(max_iterations):
-        logger.info(
-            "%s iteration %s session=%s turn=%s",
-            label,
-            iteration + 1,
-            session_id,
-            turn_id or "-",
-        )
-        message = llm.chat(_for_llm(history), tools=specs, timeout=timeout)
+    session_token = set_session_id(session_id)
+    try:
+        for iteration in range(max_iterations):
+            logger.info(
+                "%s iteration %s session=%s turn=%s",
+                label,
+                iteration + 1,
+                session_id,
+                turn_id or "-",
+            )
+            message = llm.chat(_for_llm(history), tools=specs, timeout=timeout)
 
-        tool_calls = list(message.get("tool_calls") or [])
-        if tool_calls:
-            history.append(_with_turn_id(message, turn_id))
-            if order_tool_calls is not None:
-                tool_calls = order_tool_calls(tool_calls)
-            for call in tool_calls:
-                fn = call.get("function") or {}
-                name = fn.get("name") or ""
-                arguments = fn.get("arguments") or "{}"
-                call_id = call.get("id") or name
-                logger.info("tool call: %s(%s)", name, arguments)
-                if before_tool is not None:
-                    yield from before_tool(name, _parse_arguments(arguments))
-                result = tools.execute(
-                    name, arguments, session_id=session_id
-                )
-                history.append(
-                    _with_turn_id(
-                        {
-                            "role": "tool",
-                            "tool_call_id": call_id,
-                            "content": result,
-                        },
-                        turn_id,
+            tool_calls = list(message.get("tool_calls") or [])
+            if tool_calls:
+                history.append(_with_turn_id(message, turn_id))
+                if order_tool_calls is not None:
+                    tool_calls = order_tool_calls(tool_calls)
+                for call in tool_calls:
+                    fn = call.get("function") or {}
+                    name = fn.get("name") or ""
+                    arguments = fn.get("arguments") or "{}"
+                    call_id = call.get("id") or name
+                    logger.info("tool call: %s(%s)", name, arguments)
+                    if before_tool is not None:
+                        yield from before_tool(name, _parse_arguments(arguments))
+                    result = tools.execute(
+                        name, arguments, session_id=session_id
                     )
-                )
+                    history.append(
+                        _with_turn_id(
+                            {
+                                "role": "tool",
+                                "tool_call_id": call_id,
+                                "content": result,
+                            },
+                            turn_id,
+                        )
+                    )
+                if trim_history is not None:
+                    trim_history(history)
+                continue
+
+            content = (message.get("content") or "").strip() or _EMPTY_RESPONSE
+            history.append(
+                _with_turn_id({"role": "assistant", "content": content}, turn_id)
+            )
             if trim_history is not None:
                 trim_history(history)
-            continue
+            yield content
+            return
 
-        content = (message.get("content") or "").strip() or _EMPTY_RESPONSE
         history.append(
-            _with_turn_id({"role": "assistant", "content": content}, turn_id)
+            _with_turn_id({"role": "assistant", "content": _ITERATION_LIMIT}, turn_id)
         )
         if trim_history is not None:
             trim_history(history)
-        yield content
-        return
-
-    history.append(
-        _with_turn_id({"role": "assistant", "content": _ITERATION_LIMIT}, turn_id)
-    )
-    if trim_history is not None:
-        trim_history(history)
-    yield _ITERATION_LIMIT
+        yield _ITERATION_LIMIT
+    finally:
+        reset_session_id(session_token)
 
 
 def _with_turn_id(message: dict[str, Any], turn_id: str | None) -> dict[str, Any]:

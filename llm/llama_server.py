@@ -10,6 +10,7 @@ from urllib.parse import urlsplit, urlunsplit
 import httpx
 
 from llm.base import LLMClient
+from llm.perf import log_completion, n_ctx_from_props, prompt_cache_health
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +32,7 @@ class LlamaServerAdapter(LLMClient):
         self._timeout = timeout
         self._modalities: set[str] | None = None
         self._modalities_fetched_at = 0.0
+        self._n_ctx: int | None = None
 
     @property
     def base_url(self) -> str:
@@ -66,7 +68,7 @@ class LlamaServerAdapter(LLMClient):
                 }
 
             served = self._fetch_served_model(client)
-            prompt_cache = self._fetch_prompt_cache_stats(client)
+            prompt_cache = {"prompt_cache": prompt_cache_health()}
             modalities_set = self._modalities_from_payloads(client, served)
             self._modalities = modalities_set
             self._modalities_fetched_at = time.monotonic()
@@ -125,103 +127,6 @@ class LlamaServerAdapter(LLMClient):
             pass
 
         return info
-
-    def _fetch_prompt_cache_stats(self, client: httpx.Client) -> dict[str, Any]:
-        """Aggregate prompt-cache hit ratio from llama-server GET /slots."""
-        slots_url = f"{self._server_root()}/slots"
-        try:
-            response = client.get(slots_url)
-        except httpx.HTTPError as exc:
-            return {
-                "prompt_cache": {
-                    "status": "unavailable",
-                    "detail": f"{slots_url} → {exc}",
-                }
-            }
-
-        if response.status_code != 200:
-            return {
-                "prompt_cache": {
-                    "status": "unavailable",
-                    "detail": f"{slots_url} → HTTP {response.status_code}",
-                }
-            }
-
-        try:
-            slots = response.json()
-        except ValueError:
-            return {
-                "prompt_cache": {
-                    "status": "unavailable",
-                    "detail": "invalid JSON from /slots",
-                }
-            }
-
-        if not isinstance(slots, list):
-            return {
-                "prompt_cache": {
-                    "status": "unavailable",
-                    "detail": "unexpected /slots shape",
-                }
-            }
-
-        cached_total = 0
-        prompt_total = 0
-        per_slot: list[dict[str, Any]] = []
-        for slot in slots:
-            if not isinstance(slot, dict):
-                continue
-            n_cache = slot.get("n_prompt_tokens_cache")
-            n_prompt = slot.get("n_prompt_tokens")
-            n_processed = slot.get("n_prompt_tokens_processed")
-            if n_cache is None and n_prompt is None and n_processed is None:
-                continue
-
-            cache_tokens = int(n_cache or 0)
-            if n_prompt is not None:
-                prompt_tokens = int(n_prompt)
-            else:
-                prompt_tokens = cache_tokens + int(n_processed or 0)
-
-            if prompt_tokens <= 0 and cache_tokens <= 0:
-                continue
-
-            cached_total += cache_tokens
-            prompt_total += prompt_tokens
-            ratio = (
-                round(cache_tokens / prompt_tokens,
-                      4) if prompt_tokens > 0 else None
-            )
-            per_slot.append(
-                {
-                    "id": slot.get("id"),
-                    "n_prompt_tokens_cache": cache_tokens,
-                    "n_prompt_tokens": prompt_tokens,
-                    "cache_hit_ratio": ratio,
-                }
-            )
-
-        if prompt_total <= 0:
-            return {
-                "prompt_cache": {
-                    "status": "ok",
-                    "cache_hit_ratio": None,
-                    "n_prompt_tokens_cache": 0,
-                    "n_prompt_tokens": 0,
-                    "detail": "no prompt token stats yet",
-                    "slots": per_slot,
-                }
-            }
-
-        return {
-            "prompt_cache": {
-                "status": "ok",
-                "cache_hit_ratio": round(cached_total / prompt_total, 4),
-                "n_prompt_tokens_cache": cached_total,
-                "n_prompt_tokens": prompt_total,
-                "slots": per_slot,
-            }
-        }
 
     def _health_urls(self) -> list[str]:
         """Prefer native /health, then OpenAI-compatible /v1/health and /models."""
@@ -300,10 +205,17 @@ class LlamaServerAdapter(LLMClient):
         if tools:
             payload["tools"] = tools
 
+        started = time.perf_counter()
         with httpx.Client(timeout=timeout if timeout is not None else self._timeout) as client:
             response = client.post(url, json=payload)
             response.raise_for_status()
             data = response.json()
+            wall_ms = (time.perf_counter() - started) * 1000.0
+            if isinstance(data, dict):
+                try:
+                    self._log_chat_perf(client, data, wall_ms)
+                except Exception:
+                    logger.exception("failed to log llm perf")
 
         choices = data.get("choices") or []
         if not choices:
@@ -312,6 +224,39 @@ class LlamaServerAdapter(LLMClient):
         if not isinstance(message, dict):
             raise RuntimeError(f"LLM returned invalid message: {data}")
         return message
+
+    def _log_chat_perf(
+        self,
+        client: httpx.Client,
+        data: dict[str, Any],
+        wall_ms: float,
+    ) -> None:
+        session_id, turn_id = _request_ids()
+        log_completion(
+            data,
+            wall_ms=wall_ms,
+            n_ctx=self._ensure_n_ctx(client),
+            model=self._model,
+            session_id=session_id,
+            turn_id=turn_id,
+        )
+
+    def _ensure_n_ctx(self, client: httpx.Client) -> int | None:
+        if self._n_ctx is not None:
+            return self._n_ctx
+        props = self._get_json(client, f"{self._server_root()}/props")
+        n_ctx = n_ctx_from_props(props)
+        if n_ctx:
+            self._n_ctx = n_ctx
+        return n_ctx
+
+
+def _request_ids() -> tuple[str | None, str | None]:
+    try:
+        from tools.session_context import get_session_id, get_turn_id
+    except ImportError:
+        return None, None
+    return get_session_id(), get_turn_id()
 
 
 def _parse_input_modalities(
