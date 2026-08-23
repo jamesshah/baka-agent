@@ -7,6 +7,7 @@
 #   ./run.sh restart [llama|agent|all]
 #   ./run.sh status
 #   ./run.sh logs [llama|agent]
+#   ./run.sh migrate [current|history]
 #
 # Optional env overrides (shell env wins over .env; only these keys are read from .env):
 #   LLAMA_HF_REPO   Hugging Face model for llama-server -hf (default below)
@@ -22,8 +23,10 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RUN_DIR="${ROOT}/.run"
 LOG_DIR="${RUN_DIR}/logs"
 LLAMA_PID_FILE="${RUN_DIR}/llama-server.pid"
+EMBED_PID_FILE="${RUN_DIR}/embedding-server.pid"
 AGENT_PID_FILE="${RUN_DIR}/agent.pid"
 LLAMA_LOG="${LOG_DIR}/llama-server.log"
+EMBED_LOG="${LOG_DIR}/embedding-server.log"
 AGENT_LOG="${LOG_DIR}/agent.log"
 
 # Load one KEY from .env if unset. Does not `source` the file (avoids bash
@@ -62,6 +65,9 @@ dotenv_get LLAMA_CTX_SIZE
 dotenv_get LLAMA_CACHE
 dotenv_get LLAMA_CACHE_RAM
 dotenv_get LLAMA_PORT
+dotenv_get EMBEDDING_HF_REPO
+dotenv_get EMBEDDING_CACHE
+dotenv_get EMBEDDING_PORT
 dotenv_get AGENT_HOST
 dotenv_get AGENT_PORT
 
@@ -73,9 +79,13 @@ LLAMA_CACHE="${LLAMA_CACHE:-${LLAMA_HF_REPO%%:*}}"
 # 2 GiB is safer on 24 GB unified-memory Macs than llama.cpp's 8 GiB default.
 LLAMA_CACHE_RAM="${LLAMA_CACHE_RAM:-1024}"
 LLAMA_PORT="${LLAMA_PORT:-8080}"
+EMBEDDING_HF_REPO="${EMBEDDING_HF_REPO:-nomic-ai/nomic-embed-text-v1.5-GGUF:Q4_K_M}"
+EMBEDDING_CACHE="${EMBEDDING_CACHE:-${EMBEDDING_HF_REPO%%:*}}"
+EMBEDDING_PORT="${EMBEDDING_PORT:-8081}"
 AGENT_HOST="${AGENT_HOST:-0.0.0.0}"
 AGENT_PORT="${AGENT_PORT:-8000}"
 LLAMA_HEALTH_URL="http://127.0.0.1:${LLAMA_PORT}/health"
+EMBEDDING_HEALTH_URL="http://127.0.0.1:${EMBEDDING_PORT}/health"
 AGENT_HEALTH_URL="http://127.0.0.1:${AGENT_PORT}/health"
 
 mkdir -p "${LOG_DIR}"
@@ -161,6 +171,47 @@ start_llama() {
   wait_for_url "${LLAMA_HEALTH_URL}" "llama-server" 120
 }
 
+start_embedding() {
+  if is_running "${EMBED_PID_FILE}"; then
+    echo "embedding-server already running (pid $(cat "${EMBED_PID_FILE}"))"
+    return 0
+  fi
+  if ! command -v llama-server >/dev/null 2>&1; then
+    echo "llama-server not found. Install with: brew install llama.cpp" >&2
+    exit 1
+  fi
+  local embedding_cache="${EMBEDDING_CACHE}"
+  if [[ "${embedding_cache}" != /* ]]; then
+    if [[ "${embedding_cache}" == .cache/* ]]; then
+      embedding_cache="${ROOT}/${embedding_cache}"
+    else
+      embedding_cache="${ROOT}/.cache/${embedding_cache}"
+    fi
+  fi
+  mkdir -p "${embedding_cache}"
+  echo "Starting embedding-server (-hf ${EMBEDDING_HF_REPO} --port ${EMBEDDING_PORT})…"
+  LLAMA_CACHE="${embedding_cache}" nohup llama-server \
+    -hf "${EMBEDDING_HF_REPO}" \
+    --port "${EMBEDDING_PORT}" \
+    --embedding \
+    --pooling mean \
+    --ctx-size 2048 \
+    -ngl 99 \
+    >>"${EMBED_LOG}" 2>&1 &
+  echo $! >"${EMBED_PID_FILE}"
+  echo "  pid $(cat "${EMBED_PID_FILE}")  log ${EMBED_LOG}"
+  wait_for_url "${EMBEDDING_HEALTH_URL}" "embedding-server" 120
+}
+
+run_migrations() {
+  local python_bin="${ROOT}/.venv/bin/python"
+  if [[ ! -x "${python_bin}" ]]; then
+    echo "Missing ${python_bin}; create the venv and install dependencies first." >&2
+    exit 1
+  fi
+  (cd "${ROOT}" && "${python_bin}" -m memory.migrate upgrade)
+}
+
 start_agent() {
   if is_running "${AGENT_PID_FILE}"; then
     echo "agent already running (pid $(cat "${AGENT_PID_FILE}"))"
@@ -178,6 +229,8 @@ start_agent() {
     echo "Warning: ${ROOT}/.env not found — copy .env.example and fill in credentials." >&2
   fi
 
+  echo "Applying database migrations…"
+  run_migrations
   echo "Starting agent (uvicorn app:app --host ${AGENT_HOST} --port ${AGENT_PORT})…"
   (
     cd "${ROOT}"
@@ -221,6 +274,7 @@ cmd_start() {
   case "${target}" in
     all|both|"")
       start_llama
+      start_embedding
       start_agent
       echo
       echo "Both services are up."
@@ -228,11 +282,14 @@ cmd_start() {
     llama|llama-server)
       start_llama
       ;;
+    embedding|embed)
+      start_embedding
+      ;;
     agent|app)
       start_agent
       ;;
     *)
-      echo "Unknown service: ${target} (use llama, agent, or all)" >&2
+      echo "Unknown service: ${target} (use llama, embedding, agent, or all)" >&2
       exit 1
       ;;
   esac
@@ -246,16 +303,20 @@ cmd_stop() {
   case "${target}" in
     all|both|"")
       stop_pid_file "agent" "${AGENT_PID_FILE}"
+      stop_pid_file "embedding-server" "${EMBED_PID_FILE}"
       stop_pid_file "llama-server" "${LLAMA_PID_FILE}"
       ;;
     llama|llama-server)
       stop_pid_file "llama-server" "${LLAMA_PID_FILE}"
       ;;
+    embedding|embed)
+      stop_pid_file "embedding-server" "${EMBED_PID_FILE}"
+      ;;
     agent|app)
       stop_pid_file "agent" "${AGENT_PID_FILE}"
       ;;
     *)
-      echo "Unknown service: ${target} (use llama, agent, or all)" >&2
+      echo "Unknown service: ${target} (use llama, embedding, agent, or all)" >&2
       exit 1
       ;;
   esac
@@ -277,6 +338,17 @@ cmd_status() {
     echo "  health: ok (${LLAMA_HEALTH_URL})"
   else
     echo "  health: unreachable (${LLAMA_HEALTH_URL})"
+  fi
+
+  if is_running "${EMBED_PID_FILE}"; then
+    echo "embedding:    running (pid $(cat "${EMBED_PID_FILE}"))"
+  else
+    echo "embedding:    stopped"
+  fi
+  if curl -sf "${EMBEDDING_HEALTH_URL}" >/dev/null 2>&1; then
+    echo "  health: ok (${EMBEDDING_HEALTH_URL})"
+  else
+    echo "  health: unreachable (${EMBEDDING_HEALTH_URL})"
   fi
 
   if is_running "${AGENT_PID_FILE}"; then
@@ -302,10 +374,14 @@ cmd_logs() {
       touch "${AGENT_LOG}"
       tail -n 50 -f "${AGENT_LOG}"
       ;;
+    embedding|embed)
+      touch "${EMBED_LOG}"
+      tail -n 50 -f "${EMBED_LOG}"
+      ;;
     both|all|*)
-      touch "${LLAMA_LOG}" "${AGENT_LOG}"
-      echo "=== tailing ${LLAMA_LOG} + ${AGENT_LOG} (Ctrl-C to stop) ==="
-      tail -n 20 -f "${LLAMA_LOG}" "${AGENT_LOG}"
+      touch "${LLAMA_LOG}" "${EMBED_LOG}" "${AGENT_LOG}"
+      echo "=== tailing service logs (Ctrl-C to stop) ==="
+      tail -n 20 -f "${LLAMA_LOG}" "${EMBED_LOG}" "${AGENT_LOG}"
       ;;
   esac
 }
@@ -315,11 +391,12 @@ usage() {
 Run llama-server + baka-agent in the background (macOS).
 
 Usage:
-  ./run.sh start [llama|agent|all]     # default: all
-  ./run.sh stop [llama|agent|all]
-  ./run.sh restart [llama|agent|all]
+  ./run.sh start [llama|embedding|agent|all]     # default: all
+  ./run.sh stop [llama|embedding|agent|all]
+  ./run.sh restart [llama|embedding|agent|all]
   ./run.sh status
-  ./run.sh logs [llama|agent]
+  ./run.sh logs [llama|embedding|agent]
+  ./run.sh migrate [upgrade|current|history]
 
 Examples:
   ./run.sh restart agent    # only re-run the agent
@@ -330,6 +407,8 @@ Optional env overrides (shell env wins; else .env; else defaults):
   LLAMA_HF_REPO   Hugging Face model for llama-server -hf
   LLAMA_CACHE     HF download cache dir (default: LLAMA_HF_REPO without :quant)
   LLAMA_PORT      llama-server port (default 8080)
+  EMBEDDING_HF_REPO embedding GGUF for the sidecar
+  EMBEDDING_PORT  embedding server port (default 8081)
   AGENT_HOST      uvicorn host (default 0.0.0.0)
   AGENT_PORT      uvicorn port (default 8000)
 EOF
@@ -343,6 +422,14 @@ main() {
     restart) shift || true; cmd_restart "${1:-all}" ;;
     status) cmd_status ;;
     logs) shift || true; cmd_logs "${1:-both}" ;;
+    migrate)
+      shift || true
+      case "${1:-upgrade}" in
+        upgrade) run_migrations ;;
+        current|history) (cd "${ROOT}" && "${ROOT}/.venv/bin/python" -m memory.migrate "${1}") ;;
+        *) echo "Unknown migration command: ${1}" >&2; exit 1 ;;
+      esac
+      ;;
     -h|--help|help|"") usage ;;
     *)
       echo "Unknown command: ${cmd}" >&2

@@ -12,6 +12,7 @@ from tools.session_context import get_turn_id, require_session_id
 
 if TYPE_CHECKING:
     from agents.executor_agent import ExecutorAgent
+    from memory.retrieval import ContextBuilder
 
 logger = logging.getLogger(__name__)
 
@@ -50,8 +51,13 @@ class SpawnAgentTool(Tool):
         "additionalProperties": False,
     }
 
-    def __init__(self, executor: ExecutorAgent) -> None:
+    def __init__(
+        self,
+        executor: ExecutorAgent,
+        context_builder: ContextBuilder | None = None,
+    ) -> None:
         self._executor = executor
+        self._context_builder = context_builder
 
     def is_chat_agent_tool(self) -> bool:
         return True
@@ -72,6 +78,10 @@ class SpawnAgentTool(Tool):
             return "spawn_agent error: task is required"
         requested = _as_name_list(kwargs.get("tools"))
         session_id = require_session_id()
+        if self._context_builder is not None:
+            context = self._context_builder.render(session_id, task)
+            if context:
+                task = f"{task}\n\n{context}"
         logger.info(
             "spawning executor session=%s turn=%s requested_tools=%s",
             session_id,
