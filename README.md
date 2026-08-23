@@ -3,8 +3,11 @@
 Local iMessage agent: Sendblue webhooks in, a from-scratch agent loop, and llama.cpp (`llama-server`) for local inference. No agent/LLM SDK — just FastAPI, the official Sendblue Python SDK, and raw HTTP to the model.
 
 ```
-iMessage → Sendblue → POST /webhooks/receive → agent loop → llama-server → Sendblue → iMessage
+iMessage → Sendblue → agent loop → SQLite memory + llama.cpp → Sendblue → iMessage
 ```
+
+See the [agent architecture diagram](docs/architecture.md) for the complete
+runtime, tool, memory, retrieval, and persistence flow.
 
 ## Setup
 
@@ -36,6 +39,10 @@ cp .env.example .env
 | `LLAMA_PORT` / `AGENT_HOST` / `AGENT_PORT`            | Ports/host used by `./run.sh` (defaults `8080` / `0.0.0.0` / `8000`)                                                 |
 | `ALLOWED_NUMBERS`                                     | Optional comma-separated E.164 allowlist; empty = allow all                                                          |
 | `MAX_HISTORY_MESSAGES` / `MAX_AGENT_ITERATIONS`       | History trim + tool-call loop cap                                                                                    |
+| `MEMORY_ENABLED` / `DATABASE_PATH`                    | Durable history and semantic memory toggle/path (default `true` / `.data/baka.db`)                                  |
+| `EMBEDDING_BASE_URL` / `EMBEDDING_MODEL`              | OpenAI-compatible local embedding endpoint and model id                                                             |
+| `EMBEDDING_HF_REPO` / `EMBEDDING_PORT`                | GGUF and port used by the llama.cpp embedding sidecar (defaults to Nomic Embed v1.5 / `8081`)                       |
+| `SKILLS_DIR`                                          | Shared Markdown skill directory (default `skills`)                                                                  |
 | `MCP_ENABLED`                                         | Connect MCP servers on startup (default `true`)                                                                      |
 | `MCP_CONFIG_PATH`                                     | Path to Cursor-style `mcp.json` (default `mcp.json`)                                                                 |
 | `MCP_OAUTH_DATA_DIR`                                  | Where OAuth tokens are stored (default `.data/mcp-oauth`)                                                            |
@@ -49,9 +56,11 @@ On free shared-line Sendblue plans, add the recipient as a contact and have them
 
 ```bash
 chmod +x run.sh   # once
-./run.sh start            # llama-server + agent
+./run.sh start            # chat + embedding llama-server + agent
 ./run.sh restart agent    # only re-run the agent
 ./run.sh restart llama    # only re-run llama-server
+./run.sh restart embedding
+./run.sh migrate current
 ./run.sh status
 ./run.sh logs             # Ctrl-C to stop tailing
 ./run.sh stop
@@ -75,6 +84,47 @@ LLAMA_HF_REPO=unsloth/gemma-4-12b-it-GGUF:UD-Q4_K_XL ./run.sh start
 `./run.sh` exports `LLAMA_CACHE`, uses one slot, quantized KV (`q8_0`), Flash Attention, and `--fit-target 4096` (~4 GiB free for other apps). Defaults assume Gemma 12B (~7.4 GB), which leaves more room than Muse 30B. `/health` → `checks.model.prompt_cache` reports cache hit ratio from llama.cpp `/slots`.
 
 PIDs and logs live under `.run/` (gitignored).
+
+## Memory and skills
+
+All accepted inbound turns, assistant replies, and tool messages are stored in
+`.data/baka.db`. The normalized phone number is the private memory owner; a
+turn is one inbound webhook event plus the complete assistant/tool response.
+There is no time-based session rollover.
+
+At turn start, the agent combines recent complete turns with per-phone facts,
+periodic conversation summaries, and relevant shared skills. Retrieval fuses
+SQLite FTS5 with embeddings from a small Nomic llama.cpp sidecar. If that
+sidecar is unavailable, requests continue using FTS5. Embeddings are persisted
+as float32 BLOBs; `sqlite-vec` is used when the local Python SQLite build allows
+extension loading, otherwise cosine ranking uses the portable Python fallback.
+
+Migrations run automatically before startup and can also be managed directly:
+
+```bash
+./run.sh migrate
+./run.sh migrate current
+./run.sh migrate history
+```
+
+For backup, stop the agent and copy `.data/baka.db` (plus any `-wal`/`-shm`
+files), or use SQLite's online `.backup` command while it is running.
+
+Create shared procedural skills as `skills/<name>/SKILL.md`:
+
+```markdown
+---
+name: example
+description: When this workflow applies
+tools: [get_current_time]
+triggers: [example, workflow]
+---
+Instructions supplied to the agent when this skill is retrieved.
+```
+
+The `manage_memory` chat tool lets the agent list, explicitly save/correct, or
+forget semantic memories. Clearing conversation history is separate from
+forgetting semantic memory.
 
 ### Manual: 1. Start llama.cpp
 
@@ -218,5 +268,5 @@ Local helper tools: `link_snaptrade`, `snaptrade_status`, `unlink_snaptrade`. Se
 
 - The webhook handler acknowledges with HTTP 200 right away, then processes and replies asynchronously. If llama latency is high this avoids Sendblue retries.
 - If the served model/template does not emit structured `tool_calls`, the loop treats the response as final text (still capped by `MAX_AGENT_ITERATIONS`).
-- Conversation history is in-memory only; it resets when the process restarts.
+- Conversation history and semantic memory persist in SQLite across restarts.
 - Optional `ALLOWED_NUMBERS` keeps strangers from driving your local model.
