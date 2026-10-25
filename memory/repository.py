@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy import delete, func, select, text
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from memory.database import Database
 from memory.models import (
@@ -21,6 +22,7 @@ from memory.models import (
     Memory,
     Message,
     Principal,
+    SeenHandle,
     Skill,
     Turn,
 )
@@ -113,6 +115,45 @@ class SqlAlchemyMemoryRepository:
         with self._write_lock, self._database.session() as session:
             principal, _ = self._identity(session, external_id)
             return principal.id
+
+    def is_duplicate_handle(
+        self,
+        message_handle: str,
+        *,
+        max_entries: int | None = None,
+    ) -> bool:
+        """Claim ``message_handle``; return True if it was already processed."""
+        handle = message_handle.strip()
+        if not handle:
+            return False
+        with self._write_lock, self._database.session() as session:
+            result = session.execute(
+                sqlite_insert(SeenHandle)
+                .values(message_handle=handle, created_at=_utcnow())
+                .on_conflict_do_nothing(
+                    index_elements=[SeenHandle.message_handle]
+                )
+            )
+            if result.rowcount == 0:
+                return True
+            if max_entries is not None and max_entries > 0:
+                session.execute(
+                    text(
+                        "DELETE FROM seen_handles WHERE rowid NOT IN ("
+                        "SELECT rowid FROM seen_handles "
+                        "ORDER BY created_at DESC, rowid DESC LIMIT :limit"
+                        ")"
+                    ),
+                    {"limit": max_entries},
+                )
+            return False
+
+    def has_seen_handle(self, message_handle: str) -> bool:
+        handle = message_handle.strip()
+        if not handle:
+            return False
+        with self._database.session() as session:
+            return session.get(SeenHandle, handle) is not None
 
     def load_history(
         self, principal_external_id: str, *, limit: int

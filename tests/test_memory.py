@@ -1,15 +1,22 @@
 from __future__ import annotations
 
+import asyncio
+import json
+import os
 import tempfile
 import unittest
 import logging
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
+from fastapi import BackgroundTasks
 from sqlalchemy import inspect
+from starlette.requests import Request
 
 from agents.chat_agent import ChatAgent
+from config import Settings
 from llm.base import LLMClient
 from memory.database import Database
 from memory.consolidator import MemoryConsolidator
@@ -18,6 +25,7 @@ from memory.repository import SqlAlchemyMemoryRepository
 from memory.retrieval import ContextBuilder, HybridRetriever
 from memory.skills import SkillIndexer
 from tools.registry import ToolRegistry
+from webhooks.sendblue import SendblueWebhookHandler
 
 
 class FakeEmbeddingClient:
@@ -103,6 +111,7 @@ class MemoryTestCase(unittest.TestCase):
         names = set(inspect(self.database.engine).get_table_names())
         self.assertIn("principals", names)
         self.assertIn("messages", names)
+        self.assertIn("seen_handles", names)
         self.assertIn("memories_fts", names)
         self.assertIn("skills_fts", names)
         self.assertIn("alembic_version", names)
@@ -284,6 +293,145 @@ class MemoryTestCase(unittest.TestCase):
             self.assertEqual(1, len(summaries))
         finally:
             consolidator.close()
+
+    def test_seen_handles_persist_and_dedupe_across_restarts(self) -> None:
+        self.assertFalse(self.repository.is_duplicate_handle(""))
+        self.assertFalse(self.repository.is_duplicate_handle("   "))
+        self.assertFalse(self.repository.has_seen_handle("msg-1"))
+        self.assertFalse(self.repository.is_duplicate_handle("msg-1"))
+        self.assertTrue(self.repository.has_seen_handle("msg-1"))
+        self.assertTrue(self.repository.is_duplicate_handle("msg-1"))
+
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            results = list(
+                executor.map(
+                    self.repository.is_duplicate_handle,
+                    ["msg-concurrent"] * 8,
+                )
+            )
+        self.assertEqual(1, results.count(False))
+        self.assertEqual(7, results.count(True))
+
+        reopened_db = Database(self.db_path)
+        reopened_repo = SqlAlchemyMemoryRepository(reopened_db)
+        try:
+            agent = ChatAgent(
+                FakeLLM(),
+                ToolRegistry(),
+                memory_repository=reopened_repo,
+            )
+            handler = SendblueWebhookHandler(
+                agent=agent,
+                messaging=object(),  # type: ignore[arg-type]
+                memory_repository=reopened_repo,
+            )
+            self.assertTrue(handler._is_duplicate_handle("msg-1"))
+            self.assertTrue(handler._is_duplicate_handle("msg-concurrent"))
+            self.assertFalse(handler._is_duplicate_handle("msg-2"))
+            self.assertTrue(handler._is_duplicate_handle("msg-2"))
+        finally:
+            reopened_db.close()
+
+    def test_seen_handles_respect_max_entries(self) -> None:
+        for idx in range(5):
+            self.assertFalse(
+                self.repository.is_duplicate_handle(
+                    f"handle-{idx}", max_entries=3
+                )
+            )
+        self.assertFalse(self.repository.has_seen_handle("handle-0"))
+        self.assertFalse(self.repository.has_seen_handle("handle-1"))
+        self.assertTrue(self.repository.has_seen_handle("handle-2"))
+        self.assertTrue(self.repository.has_seen_handle("handle-3"))
+        self.assertTrue(self.repository.has_seen_handle("handle-4"))
+
+    def test_webhook_handle_receive_dedupes_via_sqlite_across_restarts(
+        self,
+    ) -> None:
+        secret = "test-webhook-secret"
+        payload = {
+            "from_number": "+15550000001",
+            "content": "hello there",
+            "message_handle": "sb-handle-123",
+            "service": "iMessage",
+        }
+        raw_body = json.dumps(payload).encode("utf-8")
+
+        def make_request() -> Request:
+            async def receive() -> dict[str, Any]:
+                return {
+                    "type": "http.request",
+                    "body": raw_body,
+                    "more_body": False,
+                }
+
+            scope = {
+                "type": "http",
+                "method": "POST",
+                "path": "/webhooks/receive",
+                "headers": [(b"sb-signing-secret", secret.encode("utf-8"))],
+                "client": ("127.0.0.1", 12345),
+            }
+            return Request(scope, receive)
+
+        settings = Settings(
+            sendblue_global_webhook_secret=secret,
+            allowed_numbers="",
+        )
+        with patch("webhooks.sendblue.get_settings", return_value=settings):
+            handler1 = SendblueWebhookHandler(
+                agent=ChatAgent(
+                    FakeLLM(),
+                    ToolRegistry(),
+                    memory_repository=self.repository,
+                ),
+                messaging=object(),  # type: ignore[arg-type]
+                memory_repository=self.repository,
+            )
+            tasks1 = BackgroundTasks()
+            resp1 = asyncio.run(handler1.handle_receive(make_request(), tasks1))
+            self.assertEqual(200, resp1.status_code)
+            self.assertEqual(
+                {"received": True},
+                json.loads(bytes(resp1.body).decode("utf-8")),
+            )
+            self.assertEqual(1, len(tasks1.tasks))
+
+            tasks_dup = BackgroundTasks()
+            resp_dup = asyncio.run(
+                handler1.handle_receive(make_request(), tasks_dup)
+            )
+            self.assertEqual(200, resp_dup.status_code)
+            self.assertEqual(
+                {"received": True, "ignored": "duplicate"},
+                json.loads(bytes(resp_dup.body).decode("utf-8")),
+            )
+            self.assertEqual(0, len(tasks_dup.tasks))
+
+            reopened_db = Database(self.db_path)
+            reopened_repo = SqlAlchemyMemoryRepository(reopened_db)
+            try:
+                handler2 = SendblueWebhookHandler(
+                    agent=ChatAgent(
+                        FakeLLM(),
+                        ToolRegistry(),
+                        memory_repository=reopened_repo,
+                    ),
+                    messaging=object(),  # type: ignore[arg-type]
+                    memory_repository=reopened_repo,
+                )
+                tasks2 = BackgroundTasks()
+                resp2 = asyncio.run(
+                    handler2.handle_receive(make_request(), tasks2)
+                )
+                self.assertEqual(200, resp2.status_code)
+                self.assertEqual(
+                    {"received": True, "ignored": "duplicate"},
+                    json.loads(bytes(resp2.body).decode("utf-8")),
+                )
+                self.assertEqual(0, len(tasks2.tasks))
+            finally:
+                reopened_db.close()
 
 
 if __name__ == "__main__":

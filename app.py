@@ -130,7 +130,11 @@ _messaging = SendblueAdapter(
     api_secret=_settings.sendblue_api_secret,
     from_number=_settings.sendblue_from_number,
 )
-_webhook = SendblueWebhookHandler(agent=_agent, messaging=_messaging)
+_webhook = SendblueWebhookHandler(
+    agent=_agent,
+    messaging=_messaging,
+    memory_repository=_memory_repository,
+)
 
 
 def _on_mcp_tools_changed(added: list[Any], removed: list[str]) -> None:

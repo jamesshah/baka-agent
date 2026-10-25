@@ -208,3 +208,13 @@ class Embedding(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow
     )
+
+
+class SeenHandle(Base):
+    __tablename__ = "seen_handles"
+
+    message_handle: Mapped[str] = mapped_column(String(255), primary_key=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, index=True
+    )
+
