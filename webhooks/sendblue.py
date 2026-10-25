@@ -5,7 +5,6 @@ from __future__ import annotations
 import hmac
 import logging
 import threading
-from collections import OrderedDict
 from collections.abc import Callable, Iterator
 from typing import Any, Literal
 
@@ -14,6 +13,9 @@ from fastapi.responses import JSONResponse
 
 from agents.base import Agent
 from config import get_settings
+from memory.database import Database
+from memory.models import Base
+from memory.repository import SqlAlchemyMemoryRepository
 from messaging.base import MessagingClient
 from messaging.format import chunk_text, strip_markdown
 from messaging.media import (
@@ -97,11 +99,21 @@ class _TypingPulse:
 class SendblueWebhookHandler:
     """Verify, filter, and process Sendblue receive webhooks."""
 
-    def __init__(self, agent: Agent, messaging: MessagingClient) -> None:
+    def __init__(
+        self,
+        agent: Agent,
+        messaging: MessagingClient,
+        memory_repository: SqlAlchemyMemoryRepository | None = None,
+    ) -> None:
         self._agent = agent
         self._messaging = messaging
-        self._seen_handles: OrderedDict[str, None] = OrderedDict()
-        self._seen_lock = threading.Lock()
+        if memory_repository is None:
+            memory_repository = getattr(agent, "_memory_repository", None)
+        if memory_repository is None:
+            database = Database(":memory:")
+            Base.metadata.create_all(database.engine)
+            memory_repository = SqlAlchemyMemoryRepository(database)
+        self._memory_repository = memory_repository
 
     def verify_secret(self, request: Request) -> JSONResponse | None:
         """
@@ -135,13 +147,9 @@ class SendblueWebhookHandler:
         """Claim ``message_handle``; return True if it was already processed."""
         if not message_handle:
             return False
-        with self._seen_lock:
-            if message_handle in self._seen_handles:
-                return True
-            self._seen_handles[message_handle] = None
-            while len(self._seen_handles) > _SEEN_HANDLE_MAX:
-                self._seen_handles.popitem(last=False)
-            return False
+        return self._memory_repository.is_duplicate_handle(
+            message_handle, max_entries=_SEEN_HANDLE_MAX
+        )
 
     def _typing(
         self, number: str, state: Literal["start", "stop"]
