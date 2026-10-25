@@ -7,7 +7,7 @@ import logging
 import threading
 import uuid
 from collections.abc import Iterator
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from agents.base import Agent
 from agents.loop import run_tool_loop
@@ -17,6 +17,11 @@ from tools.registry import ToolRegistry
 from tools.send_acknowledgement import SendAcknowledgementTool
 from tools.session_context import reset_turn_id, set_turn_id
 from tools.spawn_agent import SpawnAgentTool
+
+if TYPE_CHECKING:
+    from memory.consolidator import MemoryConsolidator
+    from memory.repository import SqlAlchemyMemoryRepository
+    from memory.retrieval import ContextBuilder
 
 logger = logging.getLogger(__name__)
 
@@ -56,24 +61,41 @@ class ChatAgent(Agent):
         system_prompt: str = SYSTEM_PROMPT,
         max_history_messages: int = 40,
         max_agent_iterations: int = 5,
+        memory_repository: SqlAlchemyMemoryRepository | None = None,
+        context_builder: ContextBuilder | None = None,
+        memory_consolidator: MemoryConsolidator | None = None,
     ) -> None:
         self._llm = llm
         self._tools = tools
         self._system_prompt = system_prompt
         self._max_history_messages = max_history_messages
         self._max_agent_iterations = max_agent_iterations
+        self._memory_repository = memory_repository
+        self._context_builder = context_builder
+        self._memory_consolidator = memory_consolidator
         self._histories: dict[str, list[dict[str, Any]]] = {}
         self._history_lock = threading.Lock()
 
-    def _render_system_prompt(self) -> str:
+    def _render_system_prompt(self, memory_context: str = "") -> str:
         catalog = self._tools.catalog_text(chat_agent=False)
-        return f"{self._system_prompt.rstrip()}\n{catalog}\n"
+        prompt = f"{self._system_prompt.rstrip()}\n{catalog}\n"
+        if memory_context:
+            prompt += f"\n{memory_context}\n"
+        return prompt
 
     def _history_unlocked(self, session_id: str) -> list[dict[str, Any]]:
         if session_id not in self._histories:
-            self._histories[session_id] = [
-                {"role": "system", "content": self._render_system_prompt()},
-            ]
+            loaded = (
+                self._memory_repository.load_history(
+                    session_id, limit=max(0, self._max_history_messages - 1)
+                )
+                if self._memory_repository is not None
+                else []
+            )
+            self._histories[session_id] = [{
+                "role": "system",
+                "content": self._render_system_prompt(),
+            }, *loaded]
         return self._histories[session_id]
 
     def _trim_history(self, history: list[dict[str, Any]]) -> None:
@@ -92,6 +114,8 @@ class ChatAgent(Agent):
                 self._histories.clear()
             else:
                 self._histories.pop(session_id, None)
+            if self._memory_repository is not None:
+                self._memory_repository.clear_history(session_id)
 
     def _begin_turn(
         self,
@@ -109,15 +133,24 @@ class ChatAgent(Agent):
             "content": _stored_user_content(user_text, media),
             "turn_id": turn_id,
         }
+        memory_context = (
+            self._context_builder.render(session_id, user_text)
+            if self._context_builder is not None
+            else ""
+        )
         with self._history_lock:
             committed = self._history_unlocked(session_id)
             committed[0] = {
                 "role": "system",
-                "content": self._render_system_prompt(),
+                "content": self._render_system_prompt(memory_context),
             }
             committed.append(stored_user)
             self._trim_history(committed)
             working = copy.deepcopy(committed)
+            if self._memory_repository is not None:
+                self._memory_repository.begin_turn(
+                    session_id, turn_id, stored_user
+                )
         working[-1] = {
             "role": "user",
             "content": _user_content(user_text, media),
@@ -130,6 +163,8 @@ class ChatAgent(Agent):
         session_id: str,
         turn_id: str,
         working: list[dict[str, Any]],
+        *,
+        completed: bool = True,
     ) -> None:
         """Splice this turn's assistant/tool messages after its user message."""
         new_msgs = [
@@ -137,8 +172,6 @@ class ChatAgent(Agent):
             for message in working
             if message.get("turn_id") == turn_id and message.get("role") != "user"
         ]
-        if not new_msgs:
-            return
         with self._history_lock:
             committed = self._history_unlocked(session_id)
             insert_at: int | None = None
@@ -159,6 +192,12 @@ class ChatAgent(Agent):
             else:
                 committed[insert_at:insert_at] = new_msgs
             self._trim_history(committed)
+            if self._memory_repository is not None:
+                self._memory_repository.complete_turn(
+                    turn_id,
+                    new_msgs,
+                    status="completed" if completed else "failed",
+                )
 
     def has_multimodal(self) -> bool:
         return self._llm.has_multimodal()
@@ -185,6 +224,7 @@ class ChatAgent(Agent):
         logger.info("chat turn %s for %s", turn_id, session_id)
         turn_token = set_turn_id(turn_id)
         working: list[dict[str, Any]] | None = None
+        completed = False
         try:
             working = self._begin_turn(session_id, turn_id, user_text, media)
 
@@ -216,9 +256,16 @@ class ChatAgent(Agent):
                 before_tool=before_tool,
                 trim_history=self._trim_history,
             )
+            completed = True
         finally:
             if working is not None:
-                self._commit_turn(session_id, turn_id, working)
+                self._commit_turn(
+                    session_id, turn_id, working, completed=completed
+                )
+                if completed and self._memory_consolidator is not None:
+                    self._memory_consolidator.submit(
+                        session_id, turn_id, user_text
+                    )
             reset_turn_id(turn_token)
 
 

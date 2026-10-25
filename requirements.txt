@@ -6,3 +6,6 @@ pydantic>=2.9.0
 pydantic-settings>=2.6.0
 python-dotenv>=1.0.0
 mcp>=1.28.0
+SQLAlchemy>=2.0.0
+alembic>=1.13.0
+sqlite-vec>=0.1.6

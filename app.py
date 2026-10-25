@@ -14,10 +14,21 @@ from config import get_settings
 from llm import LlamaServerAdapter
 from mcp_client import MultiServerMcpClient, load_mcp_config
 from mcp_client.token_store import FileTokenStore
+from memory import (
+    ContextBuilder,
+    Database,
+    HybridRetriever,
+    LlamaEmbeddingClient,
+    MemoryConsolidator,
+    SkillIndexer,
+    SqlAlchemyMemoryRepository,
+)
+from memory.migrate import upgrade as upgrade_database
 from messaging import SendblueAdapter
 from tools import (
     GetCurrentTimeTool,
     LinkSnaptradeTool,
+    ManageMemoryTool,
     SendAcknowledgementTool,
     SnaptradeStatusTool,
     SpawnAgentTool,
@@ -39,6 +50,60 @@ _llm = LlamaServerAdapter(
 )
 _tools = ToolRegistry()
 _mcp: MultiServerMcpClient | None = None
+_database = Database(_settings.database_path) if _settings.memory_enabled else None
+_memory_repository = (
+    SqlAlchemyMemoryRepository(_database) if _database is not None else None
+)
+_embeddings = (
+    LlamaEmbeddingClient(
+        base_url=_settings.embedding_base_url,
+        model=_settings.embedding_model,
+        dimensions=_settings.embedding_dimensions,
+        timeout=_settings.embedding_timeout_seconds,
+    )
+    if _memory_repository is not None and _settings.embedding_enabled
+    else None
+)
+_retriever = (
+    HybridRetriever(
+        _memory_repository,
+        embeddings=_embeddings,
+        lexical_weight=_settings.memory_lexical_weight,
+        vector_weight=_settings.memory_vector_weight,
+        minimum_vector_score=_settings.memory_minimum_vector_score,
+    )
+    if _memory_repository is not None
+    else None
+)
+_context_builder = (
+    ContextBuilder(
+        _retriever,
+        max_memory_chars=_settings.memory_max_chars,
+        max_skill_chars=_settings.skill_max_chars,
+    )
+    if _retriever is not None
+    else None
+)
+_memory_consolidator = (
+    MemoryConsolidator(
+        _memory_repository,
+        _llm,
+        embeddings=_embeddings,
+        enabled=_settings.memory_consolidation_enabled,
+        summary_every_turns=_settings.memory_summary_every_turns,
+    )
+    if _memory_repository is not None
+    else None
+)
+_skill_indexer = (
+    SkillIndexer(
+        _memory_repository,
+        _settings.skills_dir,
+        embeddings=_embeddings,
+    )
+    if _memory_repository is not None
+    else None
+)
 _executor = ExecutorAgent(
     llm=_llm,
     tools=_tools,
@@ -47,13 +112,18 @@ _executor = ExecutorAgent(
 
 _tools.register(GetCurrentTimeTool())
 _tools.register(SendAcknowledgementTool())
-_tools.register(SpawnAgentTool(_executor))
+_tools.register(SpawnAgentTool(_executor, _context_builder))
+if _memory_repository is not None:
+    _tools.register(ManageMemoryTool(_memory_repository, _embeddings))
 
 _agent = ChatAgent(
     llm=_llm,
     tools=_tools,
     max_history_messages=_settings.max_history_messages,
     max_agent_iterations=_settings.max_agent_iterations,
+    memory_repository=_memory_repository,
+    context_builder=_context_builder,
+    memory_consolidator=_memory_consolidator,
 )
 _messaging = SendblueAdapter(
     api_key=_settings.sendblue_api_key,
@@ -157,6 +227,10 @@ def _overall_status(checks: dict[str, dict[str, Any]]) -> str:
 @asynccontextmanager
 async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     global _mcp
+    if _settings.memory_enabled:
+        upgrade_database(_settings.database_path)
+        indexed = _skill_indexer.sync() if _skill_indexer is not None else 0
+        logger.info("Memory database ready; indexed %d skill(s)", indexed)
     try:
         _mcp = _start_mcp()
     except Exception:  # noqa: BLE001 — app should still serve without MCP
@@ -185,6 +259,10 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     if _mcp is not None:
         _mcp.stop()
         _mcp = None
+    if _memory_consolidator is not None:
+        _memory_consolidator.close()
+    if _database is not None:
+        _database.close()
 
 
 app = FastAPI(title="baka-agent", version="0.1.0", lifespan=lifespan)
@@ -221,9 +299,30 @@ def _agents_health() -> dict[str, Any]:
     }
 
 
+def _memory_health() -> dict[str, Any]:
+    if _database is None:
+        return {"status": "disabled"}
+    try:
+        with _database.engine.connect() as connection:
+            connection.exec_driver_sql("SELECT 1")
+    except Exception as exc:
+        return {"status": "error", "detail": str(exc)}
+    result: dict[str, Any] = {
+        "status": "ok",
+        "database": _settings.database_path,
+        "semantic_retrieval": "hybrid" if _embeddings is not None else "fts5",
+    }
+    if _embeddings is not None:
+        result["embeddings"] = _embeddings.health_check()
+        if result["embeddings"].get("status") != "ok":
+            result["status"] = "degraded"
+    return result
+
+
 @app.get("/health")
 def health() -> JSONResponse:
     agents_check = _agents_health()
+    memory_check = _memory_health()
     mcp_check = _mcp_health()
     model_check = _llm.health_check()
     webhook_check = _messaging.webhook_health_check(
@@ -233,6 +332,7 @@ def health() -> JSONResponse:
 
     checks = {
         "agents": agents_check,
+        "memory": memory_check,
         "mcp": mcp_check,
         "model": model_check,
         "sendblue_webhook": webhook_check,

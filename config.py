@@ -27,6 +27,25 @@ class Settings(BaseSettings):
     max_agent_iterations: int = 5
     max_executor_iterations: int = 8
 
+    # Durable local conversation and semantic memory.
+    database_path: str = ".data/baka.db"
+    memory_enabled: bool = True
+    memory_consolidation_enabled: bool = True
+    memory_summary_every_turns: int = 20
+    memory_max_chars: int = 3000
+    skill_max_chars: int = 5000
+    skills_dir: str = "skills"
+
+    # Local llama.cpp embedding sidecar.
+    embedding_enabled: bool = True
+    embedding_base_url: str = "http://127.0.0.1:8081/v1"
+    embedding_model: str = "local-embedding"
+    embedding_dimensions: int = 768
+    embedding_timeout_seconds: float = 10.0
+    memory_lexical_weight: float = 0.45
+    memory_vector_weight: float = 0.55
+    memory_minimum_vector_score: float = 0.3
+
     # Cursor-compatible MCP config (mcpServers in a JSON file).
     mcp_config_path: str = "mcp.json"
     mcp_enabled: bool = True
