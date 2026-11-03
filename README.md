@@ -248,7 +248,7 @@ SnapTrade MCP is read-only Personal OAuth ([docs](https://docs.snaptrade.com/doc
 3. Ask about balances, positions, orders as usual. Tokens persist under `.data/mcp-oauth/` across restarts.
 4. **unlink snaptrade** — revokes access and deletes local tokens (or revoke under SnapTrade **Settings → Connected apps**).
 
-Local helper tools: `link_snaptrade`, `snaptrade_status`, `unlink_snaptrade`. Set `MCP_ENABLED=false` to skip MCP entirely.
+Local helper tools: `link_snaptrade`, `snaptrade_status`, `unlink_snaptrade` (the chat agent calls these directly, without a worker). Set `MCP_ENABLED=false` to skip MCP entirely.
 
 ## Project layout
 

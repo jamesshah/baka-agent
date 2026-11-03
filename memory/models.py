@@ -8,6 +8,7 @@ from typing import Any
 
 from sqlalchemy import (
     JSON,
+    Boolean,
     DateTime,
     Float,
     ForeignKey,
@@ -88,6 +89,10 @@ class Turn(Base):
     )
     sequence: Mapped[int] = mapped_column(Integer)
     status: Mapped[str] = mapped_column(String(24), default="processing")
+    # "user" for inbound messages, "event" for connector-triggered turns.
+    source: Mapped[str] = mapped_column(
+        String(16), default="user", server_default="user"
+    )
     started_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow
     )
@@ -216,5 +221,87 @@ class SeenHandle(Base):
     message_handle: Mapped[str] = mapped_column(String(255), primary_key=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, index=True
+    )
+
+
+class ConnectorDelivery(Base):
+    """One raw connector webhook, stored before it is enriched into events."""
+
+    __tablename__ = "connector_deliveries"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    principal_id: Mapped[str] = mapped_column(
+        ForeignKey("principals.id", ondelete="CASCADE"), index=True
+    )
+    source: Mapped[str] = mapped_column(String(64), index=True)
+    event_type: Mapped[str] = mapped_column(String(128))
+    dedupe_key: Mapped[str] = mapped_column(String(255), unique=True)
+    payload: Mapped[Any] = mapped_column(JSON, default=dict)
+    status: Mapped[str] = mapped_column(String(24), default="received", index=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow
+    )
+    processed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+
+class ExternalEvent(Base):
+    """A normalized connector event and the triage decision made for it."""
+
+    __tablename__ = "external_events"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    principal_id: Mapped[str] = mapped_column(
+        ForeignKey("principals.id", ondelete="CASCADE"), index=True
+    )
+    delivery_id: Mapped[str | None] = mapped_column(
+        ForeignKey("connector_deliveries.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    source: Mapped[str] = mapped_column(String(64), index=True)
+    event_type: Mapped[str] = mapped_column(String(128), index=True)
+    dedupe_key: Mapped[str] = mapped_column(String(255), unique=True)
+    status: Mapped[str] = mapped_column(String(24), default="pending", index=True)
+    occurred_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, index=True
+    )
+    metrics: Mapped[Any] = mapped_column(JSON, default=dict)
+    raw: Mapped[Any] = mapped_column(JSON, default=dict)
+    summary: Mapped[str] = mapped_column(Text, default="")
+    decision: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    decided_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow
+    )
+    processed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
+
+
+class EventRule(Base):
+    """A user-authored triage rule; checked before the YAML defaults."""
+
+    __tablename__ = "event_rules"
+    __table_args__ = (
+        UniqueConstraint("principal_id", "rule_id", name="uq_event_rule_identity"),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    principal_id: Mapped[str] = mapped_column(
+        ForeignKey("principals.id", ondelete="CASCADE"), index=True
+    )
+    rule_id: Mapped[str] = mapped_column(String(64))
+    match: Mapped[Any] = mapped_column(JSON, default=dict)
+    when: Mapped[str | None] = mapped_column(Text, nullable=True)
+    action: Mapped[str] = mapped_column(String(16))
+    urgent: Mapped[bool] = mapped_column(Boolean, default=False)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    note: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow
     )
 

@@ -40,6 +40,10 @@ class FileTokenStore:
     def __init__(self, data_dir: str | Path) -> None:
         self._root = Path(data_dir)
 
+    @property
+    def root(self) -> Path:
+        return self._root
+
     def path_for(self, server: str, phone: str) -> Path:
         safe_server = _safe_segment(server)
         safe_phone = _safe_phone(phone)

@@ -16,7 +16,14 @@ logger = logging.getLogger(__name__)
 SNAPTRADE_SERVER = "snaptrade"
 
 
-class LinkSnaptradeTool(Tool):
+class _ChatSnaptradeTool(Tool):
+    """Fast, single-call account tools the chat agent runs without a worker."""
+
+    def is_chat_agent_tool(self) -> bool:
+        return True
+
+
+class LinkSnaptradeTool(_ChatSnaptradeTool):
     """Start SnapTrade device OAuth and return the verification URL."""
 
     name = "link_snaptrade"
@@ -70,7 +77,7 @@ class LinkSnaptradeTool(Tool):
         }
 
 
-class SnaptradeStatusTool(Tool):
+class SnaptradeStatusTool(_ChatSnaptradeTool):
     """Report whether SnapTrade is linked for the current user."""
 
     name = "snaptrade_status"
@@ -95,7 +102,7 @@ class SnaptradeStatusTool(Tool):
         return self._client.link_status(SNAPTRADE_SERVER, phone)
 
 
-class UnlinkSnaptradeTool(Tool):
+class UnlinkSnaptradeTool(_ChatSnaptradeTool):
     """Revoke SnapTrade OAuth and drop MCP tools."""
 
     name = "unlink_snaptrade"

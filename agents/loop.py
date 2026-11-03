@@ -50,6 +50,7 @@ def run_tool_loop(
     """
     specs = tool_specs if tool_specs is not None else tools.specs()
     session_token = set_session_id(session_id)
+    executed: set[str] = set()
     try:
         for iteration in range(max_iterations):
             logger.info(
@@ -71,12 +72,21 @@ def run_tool_loop(
                     name = fn.get("name") or ""
                     arguments = fn.get("arguments") or "{}"
                     call_id = call.get("id") or name
-                    logger.info("tool call: %s(%s)", name, arguments)
-                    if before_tool is not None:
-                        yield from before_tool(name, _parse_arguments(arguments))
-                    result = tools.execute(
-                        name, arguments, session_id=session_id
-                    )
+                    parsed = _parse_arguments(arguments)
+                    signature = _call_signature(name, parsed)
+                    if signature in executed:
+                        logger.warning(
+                            "repeated tool call skipped: %s(%s)", name, arguments
+                        )
+                        result = _repeated_call_notice(name)
+                    else:
+                        executed.add(signature)
+                        logger.info("tool call: %s(%s)", name, arguments)
+                        if before_tool is not None:
+                            yield from before_tool(name, parsed)
+                        result = tools.execute(
+                            name, arguments, session_id=session_id
+                        )
                     history.append(
                         _with_turn_id(
                             {
@@ -123,6 +133,18 @@ def _for_llm(history: list[dict[str, Any]]) -> list[dict[str, Any]]:
         {key: value for key, value in message.items() if key != _TURN_ID_KEY}
         for message in history
     ]
+
+
+def _call_signature(name: str, arguments: dict[str, Any]) -> str:
+    return f"{name}:{json.dumps(arguments, sort_keys=True, default=str)}"
+
+
+def _repeated_call_notice(name: str) -> str:
+    return (
+        f"Not run: you already called {name} with these exact arguments this "
+        "turn and its result is above. Do not call it again. Reply to the user "
+        "now, or use a different tool."
+    )
 
 
 def _parse_arguments(arguments: str | dict[str, Any] | None) -> dict[str, Any]:
