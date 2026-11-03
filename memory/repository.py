@@ -16,21 +16,71 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from memory.database import Database
 from memory.models import (
+    ConnectorDelivery,
     Conversation,
     ConversationSummary,
     Embedding,
+    EventRule,
+    ExternalEvent,
     Memory,
     Message,
     Principal,
     SeenHandle,
     Skill,
     Turn,
+    new_id,
 )
-from memory.store import MemoryHit, SkillHit
+from memory.store import (
+    DeliveryRecord,
+    EventRecord,
+    EventRuleRecord,
+    MemoryHit,
+    SkillHit,
+)
 
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _as_utc(value: datetime | None) -> datetime | None:
+    """SQLite drops tzinfo on read; every stored timestamp is UTC."""
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _event_record(event: ExternalEvent, external_id: str) -> EventRecord:
+    return EventRecord(
+        id=event.id,
+        principal_external_id=external_id,
+        source=event.source,
+        event_type=event.event_type,
+        dedupe_key=event.dedupe_key,
+        status=event.status,
+        occurred_at=_as_utc(event.occurred_at) or _utcnow(),
+        summary=event.summary or "",
+        metrics=dict(event.metrics or {}),
+        raw=dict(event.raw or {}),
+        decision=event.decision,
+        decided_by=event.decided_by,
+        reason=event.reason,
+    )
+
+
+def _rule_record(rule: EventRule) -> EventRuleRecord:
+    return EventRuleRecord(
+        rule_id=rule.rule_id,
+        match=dict(rule.match or {}),
+        when=rule.when,
+        action=rule.action,
+        urgent=bool(rule.urgent),
+        enabled=bool(rule.enabled),
+        note=rule.note or "",
+        created_at=_as_utc(rule.created_at) or _utcnow(),
+    )
 
 
 def _fts_query(value: str) -> str:
@@ -201,6 +251,8 @@ class SqlAlchemyMemoryRepository:
         principal_external_id: str,
         turn_id: str,
         user_message: dict[str, Any],
+        *,
+        source: str = "user",
     ) -> None:
         with self._write_lock, self._database.session() as session:
             if session.get(Turn, turn_id) is not None:
@@ -219,6 +271,7 @@ class SqlAlchemyMemoryRepository:
                 conversation_id=conversation.id,
                 sequence=next_sequence,
                 status="processing",
+                source=source,
             )
             message = Message(
                 turn_id=turn_id,
@@ -893,3 +946,338 @@ class SqlAlchemyMemoryRepository:
             if distances is None or embedding.id in distances
         ]
         return sorted(hits, key=lambda hit: hit.score, reverse=True)[:limit]
+
+    def turn_source(self, turn_id: str) -> str | None:
+        with self._database.session() as session:
+            turn = session.get(Turn, turn_id)
+            return turn.source if turn is not None else None
+
+    # --- connector deliveries -------------------------------------------------
+
+    def record_delivery(
+        self,
+        principal_external_id: str,
+        *,
+        source: str,
+        event_type: str,
+        dedupe_key: str,
+        payload: dict[str, Any],
+    ) -> str | None:
+        """Store a raw webhook; return its id, or None if it was a duplicate."""
+        with self._write_lock, self._database.session() as session:
+            principal, _ = self._identity(session, principal_external_id)
+            delivery_id = new_id()
+            result = session.execute(
+                sqlite_insert(ConnectorDelivery)
+                .values(
+                    id=delivery_id,
+                    principal_id=principal.id,
+                    source=source,
+                    event_type=event_type,
+                    dedupe_key=dedupe_key,
+                    payload=payload,
+                    status="received",
+                    attempts=0,
+                    created_at=_utcnow(),
+                )
+                .on_conflict_do_nothing(
+                    index_elements=[ConnectorDelivery.dedupe_key]
+                )
+            )
+            return delivery_id if result.rowcount else None
+
+    def get_delivery(self, delivery_id: str) -> DeliveryRecord | None:
+        with self._database.session() as session:
+            row = session.execute(
+                select(ConnectorDelivery, Principal.external_id)
+                .join(Principal, Principal.id == ConnectorDelivery.principal_id)
+                .where(ConnectorDelivery.id == delivery_id)
+            ).first()
+        if row is None:
+            return None
+        delivery, external_id = row
+        return DeliveryRecord(
+            id=delivery.id,
+            principal_external_id=external_id,
+            source=delivery.source,
+            event_type=delivery.event_type,
+            dedupe_key=delivery.dedupe_key,
+            payload=dict(delivery.payload or {}),
+            status=delivery.status,
+            attempts=delivery.attempts,
+        )
+
+    def delivery_ids_with_status(self, *statuses: str) -> list[str]:
+        with self._database.session() as session:
+            return list(session.scalars(
+                select(ConnectorDelivery.id)
+                .where(ConnectorDelivery.status.in_(statuses))
+                .order_by(ConnectorDelivery.created_at)
+            ).all())
+
+    def mark_delivery(
+        self,
+        delivery_id: str,
+        status: str,
+        *,
+        error: str | None = None,
+        count_attempt: bool = False,
+    ) -> None:
+        with self._write_lock, self._database.session() as session:
+            delivery = session.get(ConnectorDelivery, delivery_id)
+            if delivery is None:
+                return
+            delivery.status = status
+            delivery.error = error
+            if count_attempt:
+                delivery.attempts += 1
+            if status != "received":
+                delivery.processed_at = _utcnow()
+
+    # --- external events ------------------------------------------------------
+
+    def insert_event(
+        self,
+        principal_external_id: str,
+        *,
+        source: str,
+        event_type: str,
+        dedupe_key: str,
+        occurred_at: datetime,
+        metrics: dict[str, Any],
+        raw: dict[str, Any],
+        summary: str,
+        delivery_id: str | None = None,
+    ) -> str | None:
+        """Store a normalized event; return its id, or None if duplicate."""
+        with self._write_lock, self._database.session() as session:
+            principal, _ = self._identity(session, principal_external_id)
+            event_id = new_id()
+            result = session.execute(
+                sqlite_insert(ExternalEvent)
+                .values(
+                    id=event_id,
+                    principal_id=principal.id,
+                    delivery_id=delivery_id,
+                    source=source,
+                    event_type=event_type,
+                    dedupe_key=dedupe_key,
+                    status="pending",
+                    occurred_at=_as_utc(occurred_at),
+                    metrics=metrics,
+                    raw=raw,
+                    summary=summary,
+                    created_at=_utcnow(),
+                )
+                .on_conflict_do_nothing(
+                    index_elements=[ExternalEvent.dedupe_key]
+                )
+            )
+            return event_id if result.rowcount else None
+
+    def get_event(self, event_id: str) -> EventRecord | None:
+        with self._database.session() as session:
+            row = session.execute(
+                select(ExternalEvent, Principal.external_id)
+                .join(Principal, Principal.id == ExternalEvent.principal_id)
+                .where(ExternalEvent.id == event_id)
+            ).first()
+        return _event_record(*row) if row is not None else None
+
+    def event_ids_with_status(self, *statuses: str) -> list[str]:
+        with self._database.session() as session:
+            return list(session.scalars(
+                select(ExternalEvent.id)
+                .where(ExternalEvent.status.in_(statuses))
+                .order_by(ExternalEvent.created_at)
+            ).all())
+
+    def update_event(
+        self,
+        event_id: str,
+        *,
+        status: str,
+        decision: str | None = None,
+        decided_by: str | None = None,
+        reason: str | None = None,
+    ) -> None:
+        with self._write_lock, self._database.session() as session:
+            event = session.get(ExternalEvent, event_id)
+            if event is None:
+                return
+            event.status = status
+            if decision is not None:
+                event.decision = decision
+            if decided_by is not None:
+                event.decided_by = decided_by
+            if reason is not None:
+                event.reason = reason
+            event.processed_at = _utcnow()
+
+    def recent_events(
+        self,
+        principal_external_id: str,
+        *,
+        since: datetime | None = None,
+        source: str | None = None,
+        event_type: str | None = None,
+        exclude_statuses: tuple[str, ...] = (),
+        limit: int = 20,
+    ) -> list[EventRecord]:
+        """Newest-first events; ``event_type`` may contain ``*`` wildcards."""
+        query = (
+            select(ExternalEvent)
+            .join(Principal, Principal.id == ExternalEvent.principal_id)
+            .where(Principal.external_id == principal_external_id)
+        )
+        if since is not None:
+            query = query.where(ExternalEvent.occurred_at >= _as_utc(since))
+        if source:
+            query = query.where(ExternalEvent.source == source)
+        if event_type:
+            if "*" in event_type:
+                query = query.where(
+                    ExternalEvent.event_type.like(event_type.replace("*", "%"))
+                )
+            else:
+                query = query.where(ExternalEvent.event_type == event_type)
+        if exclude_statuses:
+            query = query.where(ExternalEvent.status.not_in(exclude_statuses))
+        with self._database.session() as session:
+            rows = session.scalars(
+                query.order_by(ExternalEvent.occurred_at.desc()).limit(limit)
+            ).all()
+        return [_event_record(row, principal_external_id) for row in rows]
+
+    def last_event_at(self, source: str) -> datetime | None:
+        with self._database.session() as session:
+            value = session.scalar(
+                select(func.max(ExternalEvent.occurred_at)).where(
+                    ExternalEvent.source == source
+                )
+            )
+        return _as_utc(value)
+
+    def principals_with_pending_digest(self) -> list[str]:
+        with self._database.session() as session:
+            return list(session.scalars(
+                select(Principal.external_id)
+                .join(ExternalEvent, ExternalEvent.principal_id == Principal.id)
+                .where(ExternalEvent.status == "digest_pending")
+                .distinct()
+            ).all())
+
+    def pending_digest(self, principal_external_id: str) -> list[EventRecord]:
+        with self._database.session() as session:
+            rows = session.scalars(
+                select(ExternalEvent)
+                .join(Principal, Principal.id == ExternalEvent.principal_id)
+                .where(
+                    Principal.external_id == principal_external_id,
+                    ExternalEvent.status == "digest_pending",
+                )
+                .order_by(ExternalEvent.occurred_at)
+            ).all()
+        return [_event_record(row, principal_external_id) for row in rows]
+
+    def proactive_count_since(
+        self, principal_external_id: str, since: datetime
+    ) -> int:
+        """Events that texted the user on their own since ``since``."""
+        with self._database.session() as session:
+            return int(session.scalar(
+                select(func.count(ExternalEvent.id))
+                .join(Principal, Principal.id == ExternalEvent.principal_id)
+                .where(
+                    Principal.external_id == principal_external_id,
+                    ExternalEvent.status == "notified",
+                    ExternalEvent.processed_at >= _as_utc(since),
+                )
+            ) or 0)
+
+    # --- user event rules -----------------------------------------------------
+
+    def list_event_rules(
+        self, principal_external_id: str, *, enabled_only: bool = False
+    ) -> list[EventRuleRecord]:
+        """User rules, newest first (the order they are evaluated in)."""
+        query = (
+            select(EventRule)
+            .join(Principal, Principal.id == EventRule.principal_id)
+            .where(Principal.external_id == principal_external_id)
+        )
+        if enabled_only:
+            query = query.where(EventRule.enabled.is_(True))
+        with self._database.session() as session:
+            rows = session.scalars(
+                query.order_by(EventRule.created_at.desc(), EventRule.id.desc())
+            ).all()
+        return [_rule_record(row) for row in rows]
+
+    def put_event_rule(
+        self,
+        principal_external_id: str,
+        *,
+        rule_id: str,
+        match: dict[str, Any],
+        when: str | None,
+        action: str,
+        urgent: bool = False,
+        note: str = "",
+    ) -> EventRuleRecord:
+        """Create or replace a user rule (replacing re-enables it)."""
+        with self._write_lock, self._database.session() as session:
+            principal, _ = self._identity(session, principal_external_id)
+            rule = session.scalar(
+                select(EventRule).where(
+                    EventRule.principal_id == principal.id,
+                    EventRule.rule_id == rule_id,
+                )
+            )
+            if rule is None:
+                rule = EventRule(
+                    principal_id=principal.id,
+                    rule_id=rule_id,
+                    created_at=_utcnow(),
+                )
+                session.add(rule)
+            rule.match = match
+            rule.when = when
+            rule.action = action
+            rule.urgent = urgent
+            rule.enabled = True
+            rule.note = note
+            session.flush()
+            return _rule_record(rule)
+
+    def set_event_rule_enabled(
+        self, principal_external_id: str, rule_id: str, enabled: bool
+    ) -> bool:
+        with self._write_lock, self._database.session() as session:
+            rule = session.scalar(
+                select(EventRule)
+                .join(Principal, Principal.id == EventRule.principal_id)
+                .where(
+                    Principal.external_id == principal_external_id,
+                    EventRule.rule_id == rule_id,
+                )
+            )
+            if rule is None:
+                return False
+            rule.enabled = enabled
+            return True
+
+    def delete_event_rule(self, principal_external_id: str, rule_id: str) -> bool:
+        with self._write_lock, self._database.session() as session:
+            rule = session.scalar(
+                select(EventRule)
+                .join(Principal, Principal.id == EventRule.principal_id)
+                .where(
+                    Principal.external_id == principal_external_id,
+                    EventRule.rule_id == rule_id,
+                )
+            )
+            if rule is None:
+                return False
+            session.delete(rule)
+            return True

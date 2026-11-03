@@ -52,6 +52,36 @@ class Settings(BaseSettings):
     mcp_oauth_data_dir: str = ".data/mcp-oauth"
     mcp_oauth_owner_number: str = ""
 
+    # Public origin of this server (tunnel host), e.g. https://xxxx.trycloudflare.com.
+    # Connector webhooks arrive at <public_base_url>/webhooks/connectors/<name>.
+    public_base_url: str = ""
+
+    # Whoop connector (https://developer.whoop.com). Set the app's webhook URL
+    # to <public_base_url>/webhooks/connectors/whoop with model version v2.
+    whoop_client_id: str = ""
+    whoop_client_secret: str = ""
+    # Defaults to <public_base_url>/oauth/whoop/callback; must match the dashboard.
+    whoop_redirect_url: str = ""
+
+    # Connector event triage.
+    events_enabled: bool = True
+    event_rules_path: str = "events/rules/defaults.yaml"
+    # Local window when non-urgent "notify" events wait for the digest, e.g. 22-7.
+    event_quiet_hours: str = "22-7"
+    event_max_proactive_per_day: int = 3
+    # Local time for the daily digest (HH:MM); empty disables it.
+    event_digest_time: str = "08:30"
+    # IANA timezone for quiet hours and the digest; empty uses the system zone.
+    event_timezone: str = ""
+    recent_events_hours: int = 24
+
+    @property
+    def resolved_whoop_redirect_url(self) -> str:
+        if self.whoop_redirect_url.strip():
+            return self.whoop_redirect_url.strip()
+        base = self.public_base_url.strip().rstrip("/")
+        return f"{base}/oauth/whoop/callback" if base else ""
+
     @property
     def allowed_numbers_set(self) -> set[str]:
         if not self.allowed_numbers.strip():

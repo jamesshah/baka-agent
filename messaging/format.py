@@ -12,7 +12,13 @@ _INLINE_CODE_RE = re.compile(r"`([^`]+)`")
 _LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
 _IMAGE_RE = re.compile(r"!\[([^\]]*)\]\(([^)]+)\)")
 _HEADING_RE = re.compile(r"^#{1,6}\s+", re.MULTILINE)
-_BOLD_ITALIC_RE = re.compile(r"(\*\*\*|___|\*\*|__|\*|_)(.*?)\1", re.DOTALL)
+_URL_RE = re.compile(r"https?://[^\s<>()]+")
+_URL_PLACEHOLDER_RE = re.compile(r"\x00(\d+)\x00")
+_STAR_EMPHASIS_RE = re.compile(r"(\*\*\*|\*\*|\*)(.*?)\1", re.DOTALL)
+# Underscores only count as emphasis at word boundaries, so snake_case survives.
+_UNDERSCORE_EMPHASIS_RE = re.compile(
+    r"(?<!\w)(___|__|_)(?=\S)(.+?)(?<=\S)\1(?!\w)", re.DOTALL
+)
 _STRIKE_RE = re.compile(r"~~(.*?)~~", re.DOTALL)
 _BLOCKQUOTE_RE = re.compile(r"^>\s?", re.MULTILINE)
 _HORIZONTAL_RULE_RE = re.compile(r"^\s*([-*_]\s*){3,}\s*$", re.MULTILINE)
@@ -29,6 +35,13 @@ def strip_markdown(text: str) -> str:
     out = _CODE_FENCE_RE.sub(lambda m: m.group(1).rstrip(), out)
     out = _IMAGE_RE.sub(lambda m: m.group(1) or m.group(2), out)
     out = _LINK_RE.sub(r"\1 (\2)", out)
+    urls: list[str] = []
+
+    def _hold_url(match: re.Match[str]) -> str:
+        urls.append(match.group(0))
+        return f"\x00{len(urls) - 1}\x00"
+
+    out = _URL_RE.sub(_hold_url, out)
     out = _INLINE_CODE_RE.sub(r"\1", out)
     out = _HEADING_RE.sub("", out)
     out = _HORIZONTAL_RULE_RE.sub("", out)
@@ -37,7 +50,9 @@ def strip_markdown(text: str) -> str:
     out = _STRIKE_RE.sub(r"\1", out)
     # Repeat for nested emphasis like ***bold italic***.
     for _ in range(3):
-        out = _BOLD_ITALIC_RE.sub(r"\2", out)
+        out = _STAR_EMPHASIS_RE.sub(r"\2", out)
+        out = _UNDERSCORE_EMPHASIS_RE.sub(r"\2", out)
+    out = _URL_PLACEHOLDER_RE.sub(lambda m: urls[int(m.group(1))], out)
     out = _MULTI_NEWLINE_RE.sub("\n\n", out)
     return out.strip()
 

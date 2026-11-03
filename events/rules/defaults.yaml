@@ -1,0 +1,47 @@
+# Default event triage rules. Edits are picked up without a restart.
+#
+# Evaluation: the user's own rules (created by texting the agent) are checked
+# first, newest first, then these rules top to bottom. The first match wins.
+# When nothing matches, the LLM triages the event.
+#
+#   id:     unique, lowercase letters/digits/_/-
+#   match:  source and type, both optional; glob patterns like "*.deleted"
+#   when:   optional condition over the event's metrics, e.g.
+#             recovery_score < 34
+#             not nap and sleep_hours < 5.5
+#             sport in ["running", "cycling"] and strain >= 15
+#   action: notify (text now) | digest (daily summary) | remember (store for
+#           later questions) | ignore
+#   urgent: true to text even during quiet hours or past the daily cap
+#   note:   optional; shown to the agent as the reason
+
+- id: ignore_deletes
+  match: { type: "*.deleted" }
+  action: ignore
+
+# --- Whoop ------------------------------------------------------------------
+
+- id: whoop_low_recovery
+  match: { source: whoop, type: recovery.updated }
+  when: "recovery_score < 34"
+  action: notify
+  note: Recovery is in the red.
+
+- id: whoop_short_sleep
+  match: { source: whoop, type: sleep.updated }
+  when: "not nap and sleep_hours < 5.5"
+  action: notify
+  note: Short main sleep.
+
+- id: whoop_naps
+  match: { source: whoop, type: sleep.updated }
+  when: "nap"
+  action: remember
+
+- id: whoop_workouts
+  match: { source: whoop, type: workout.updated }
+  action: remember
+
+- id: whoop_routine
+  match: { source: whoop }
+  action: digest
