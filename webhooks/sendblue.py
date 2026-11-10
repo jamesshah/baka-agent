@@ -17,13 +17,13 @@ from memory.database import Database
 from memory.models import Base
 from memory.repository import SqlAlchemyMemoryRepository
 from messaging.base import MessagingClient
-from messaging.format import chunk_text, strip_markdown
 from messaging.media import (
     MULTIMODAL_REFUSAL,
     MediaDownloadError,
     UnsupportedAttachment,
     download_media,
 )
+from messaging.outbound import deliver_replies
 
 logger = logging.getLogger(__name__)
 
@@ -179,27 +179,13 @@ class SendblueWebhookHandler:
         pulse = _TypingPulse(lambda state: self._typing(from_number, state))
         try:
             with pulse:
-                for reply in self._iter_inbound(from_number, content, media_url):
-                    plain = strip_markdown(reply)
-                    chunks = chunk_text(plain)
-                    if not chunks:
-                        logger.warning(
-                            "empty reply after format for %s — not sending",
-                            from_number,
-                        )
-                        continue
-
-                    logger.info(
-                        "replying to %s (%d chunk(s)): %s",
-                        from_number,
-                        len(chunks),
-                        chunks[0][:200],
-                    )
-
-                    pulse.stop()
-                    for chunk in chunks:
-                        self._messaging.send_message(from_number, chunk)
-                    pulse.start()
+                deliver_replies(
+                    self._messaging,
+                    from_number,
+                    self._iter_inbound(from_number, content, media_url),
+                    before_send=pulse.stop,
+                    after_send=pulse.start,
+                )
         except Exception:
             logger.exception("failed to process message from %s", from_number)
             try:

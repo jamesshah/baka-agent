@@ -6,11 +6,12 @@ import copy
 import logging
 import threading
 import uuid
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from typing import TYPE_CHECKING, Any
 
 from agents.base import Agent
 from agents.loop import run_tool_loop
+from events.format import event_context_query, format_event_message
 from llm.base import LLMClient
 from messaging.media import DownloadedMedia
 from tools.registry import ToolRegistry
@@ -22,6 +23,7 @@ if TYPE_CHECKING:
     from memory.consolidator import MemoryConsolidator
     from memory.repository import SqlAlchemyMemoryRepository
     from memory.retrieval import ContextBuilder
+    from memory.store import EventRecord
 
 logger = logging.getLogger(__name__)
 
@@ -38,9 +40,10 @@ Format: plain iMessage-friendly text. Keep replies under ~400 chars when you can
 
 When to reply yourself:
 Answer small talk, simple questions, and anything you can handle from the conversation (including photos you can see) without tools.
+To link, check, or unlink a connected account (e.g. SnapTrade, Whoop), call its link_*, *_status, or unlink_* tool yourself and text the user the link or result. No acknowledgement or spawn_agent needed.
 
 When to delegate:
-If the request needs tools, lookups, SnapTrade, or extended reasoning, do not answer it yourself.
+If the request needs other tools, lookups, or extended reasoning, do not answer it yourself.
 1. Call send_acknowledgement with a short iMessage-style ping. Make it short and sweet but don't be too generic or robotic. 
 2. Call spawn_agent with a complete task description and the worker tool names this task needs (from the catalog below). Use an empty tools list for reasoning-only work. The worker has no chat history — put every fact and instruction it needs in task. Grant only the tools required for this task.
 Prefer calling both tools in the same turn. 
@@ -76,12 +79,11 @@ class ChatAgent(Agent):
         self._histories: dict[str, list[dict[str, Any]]] = {}
         self._history_lock = threading.Lock()
 
-    def _render_system_prompt(self, memory_context: str = "") -> str:
+    def _render_system_prompt(self) -> str:
+        # Must stay byte-identical across turns: llama-server can only reuse the
+        # KV cache for an unchanged prompt prefix (Gemma's SWA rules out partial reuse).
         catalog = self._tools.catalog_text(chat_agent=False)
-        prompt = f"{self._system_prompt.rstrip()}\n{catalog}\n"
-        if memory_context:
-            prompt += f"\n{memory_context}\n"
-        return prompt
+        return f"{self._system_prompt.rstrip()}\n{catalog}\n"
 
     def _history_unlocked(self, session_id: str) -> list[dict[str, Any]]:
         if session_id not in self._histories:
@@ -99,13 +101,19 @@ class ChatAgent(Agent):
         return self._histories[session_id]
 
     def _trim_history(self, history: list[dict[str, Any]]) -> None:
-        """Keep system prompt + the most recent N messages."""
+        """
+        Once over N messages, drop down to the system prompt + the newest ~N/2,
+        starting at a user message. Trimming in chunks keeps the prompt prefix
+        stable (cacheable) for many turns instead of shifting it every turn.
+        """
         max_msgs = self._max_history_messages
         if len(history) <= max_msgs:
             return
         system = history[0]
-        rest = history[1:]
-        history[:] = [system, *rest[-(max_msgs - 1):]]
+        rest = history[1:][-max(1, max_msgs // 2):]
+        while len(rest) > 1 and rest[0].get("role") != "user":
+            rest.pop(0)
+        history[:] = [system, *rest]
 
     def clear_history(self, session_id: str | None = None) -> None:
         """Clear one conversation or all conversations."""
@@ -123,6 +131,9 @@ class ChatAgent(Agent):
         turn_id: str,
         user_text: str,
         media: DownloadedMedia | None,
+        *,
+        source: str = "user",
+        context_query: str | None = None,
     ) -> list[dict[str, Any]]:
         """
         Record this turn's user message on the shared session history, then
@@ -134,7 +145,10 @@ class ChatAgent(Agent):
             "turn_id": turn_id,
         }
         memory_context = (
-            self._context_builder.render(session_id, user_text)
+            self._context_builder.render(
+                session_id,
+                context_query if context_query is not None else user_text,
+            )
             if self._context_builder is not None
             else ""
         )
@@ -142,18 +156,20 @@ class ChatAgent(Agent):
             committed = self._history_unlocked(session_id)
             committed[0] = {
                 "role": "system",
-                "content": self._render_system_prompt(memory_context),
+                "content": self._render_system_prompt(),
             }
             committed.append(stored_user)
             self._trim_history(committed)
             working = copy.deepcopy(committed)
             if self._memory_repository is not None:
                 self._memory_repository.begin_turn(
-                    session_id, turn_id, stored_user
+                    session_id, turn_id, stored_user, source=source
                 )
+        # Retrieved memory goes on this turn's message only (never stored), so
+        # the system prompt and earlier history stay a stable cached prefix.
         working[-1] = {
             "role": "user",
-            "content": _user_content(user_text, media),
+            "content": _user_content(user_text, media, memory_context),
             "turn_id": turn_id,
         }
         return working
@@ -220,18 +236,67 @@ class ChatAgent(Agent):
         history copy so a follow-up from the same user does not interleave
         with in-flight tool calls. Results are spliced back by turn_id.
         """
+        yield from self._run(session_id, user_text, media)
+
+    def run_event_turn(
+        self,
+        session_id: str,
+        events: Sequence[EventRecord],
+        *,
+        digest: bool = False,
+    ) -> Iterator[str]:
+        """
+        Turn connector events into a proactive message for ``session_id``.
+
+        The event text is stored as this turn's user message (tagged
+        ``source="event"``) so a follow-up like "why?" sees it in history. It
+        is never consolidated into memory, and acknowledgements are dropped
+        since nobody is waiting on a reply.
+        """
+        if not events:
+            return
+        yield from self._run(
+            session_id,
+            format_event_message(events, digest=digest),
+            None,
+            source="event",
+            context_query=event_context_query(events),
+            consolidate=False,
+            forward_acks=False,
+        )
+
+    def _run(
+        self,
+        session_id: str,
+        user_text: str,
+        media: DownloadedMedia | None,
+        *,
+        source: str = "user",
+        context_query: str | None = None,
+        consolidate: bool = True,
+        forward_acks: bool = True,
+    ) -> Iterator[str]:
         turn_id = uuid.uuid4().hex
-        logger.info("chat turn %s for %s", turn_id, session_id)
+        logger.info("chat turn %s (%s) for %s", turn_id, source, session_id)
         turn_token = set_turn_id(turn_id)
         working: list[dict[str, Any]] | None = None
         completed = False
         try:
-            working = self._begin_turn(session_id, turn_id, user_text, media)
+            working = self._begin_turn(
+                session_id,
+                turn_id,
+                user_text,
+                media,
+                source=source,
+                context_query=context_query,
+            )
 
             acked = False
 
             def before_tool(name: str, kwargs: dict[str, Any]) -> Iterator[str]:
                 nonlocal acked
+                if not forward_acks:
+                    return
                 if name == SendAcknowledgementTool.name:
                     msg = (kwargs.get("message")
                            or "").strip() or _FALLBACK_ACK
@@ -262,7 +327,11 @@ class ChatAgent(Agent):
                 self._commit_turn(
                     session_id, turn_id, working, completed=completed
                 )
-                if completed and self._memory_consolidator is not None:
+                if (
+                    completed
+                    and consolidate
+                    and self._memory_consolidator is not None
+                ):
                     self._memory_consolidator.submit(
                         session_id, turn_id, user_text
                     )
@@ -288,8 +357,11 @@ def _order_chat_tool_calls(
 def _user_content(
     user_text: str,
     media: DownloadedMedia | None,
+    memory_context: str = "",
 ) -> str | list[dict[str, object]]:
     text = user_text.strip() or (_DEFAULT_MEDIA_CAPTION if media is not None else "")
+    if memory_context:
+        text = f"<context>\n{memory_context}\n</context>\n\n{text}"
     if media is None:
         return text
     return [
