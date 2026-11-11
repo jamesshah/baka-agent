@@ -20,6 +20,8 @@ You are only allowed to use the tools provided in this request - do not assume o
 SnapTrade portfolio tools are read-only and require a one-time link:
 if the task is about balances/positions/orders and SnapTrade is not linked, call link_snaptrade and include the verification URL in your result.
 Brokerage connection links from SnapTrade expire in about 5 minutes.
+
+Composio Tool Router (COMPOSIO_SEARCH_TOOLS, COMPOSIO_MANAGE_CONNECTIONS, COMPOSIO_MULTI_EXECUTE_TOOL, etc.) reaches apps like Google Calendar. If a toolkit is not connected, call COMPOSIO_MANAGE_CONNECTIONS (when granted) and include the Connect Link URL in your result so the user can approve in a browser. Do not use SnapTrade tools for Calendar.
 """
 
 

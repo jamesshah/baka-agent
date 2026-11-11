@@ -47,6 +47,8 @@ cp .env.example .env
 | `MCP_CONFIG_PATH`                                     | Path to Cursor-style `mcp.json` (default `mcp.json`)                                                                 |
 | `MCP_OAUTH_DATA_DIR`                                  | Where OAuth tokens are stored (default `.data/mcp-oauth`)                                                            |
 | `MCP_OAUTH_OWNER_NUMBER`                              | Phone that owns SnapTrade tokens (defaults to sole `ALLOWED_NUMBERS` entry)                                          |
+| `COMPOSIO_ENABLED` / `COMPOSIO_API_KEY`               | Composio Sessions Tool Router (default `true` when key set)                                                          |
+| `COMPOSIO_TOOLKITS`                                   | Comma-separated toolkit allowlist (default `googlecalendar`)                                                         |
 
 On free shared-line Sendblue plans, add the recipient as a contact and have them text your number once to complete verification before messaging works.
 
@@ -250,15 +252,36 @@ SnapTrade MCP is read-only Personal OAuth ([docs](https://docs.snaptrade.com/doc
 
 Local helper tools: `link_snaptrade`, `snaptrade_status`, `unlink_snaptrade` (the chat agent calls these directly, without a worker). Set `MCP_ENABLED=false` to skip MCP entirely.
 
+## Composio tools
+
+[Composio](https://composio.dev) Sessions expose SaaS apps (Google Calendar, etc.) without standing up a per-app MCP server or Google Cloud OAuth project. Auth is a Connect Link texted over iMessage — same idea as SnapTrade.
+
+```bash
+# in .env
+COMPOSIO_ENABLED=true
+COMPOSIO_API_KEY=...          # from https://platform.composio.dev
+COMPOSIO_TOOLKITS=googlecalendar
+```
+
+On startup the agent creates a Tool Router session and registers a small set of meta tools (`COMPOSIO_SEARCH_TOOLS`, `COMPOSIO_MANAGE_CONNECTIONS`, `COMPOSIO_MULTI_EXECUTE_TOOL`, …) plus chat-agent helpers (same pattern as SnapTrade/Whoop):
+
+1. Text **link my Google Calendar** / **connect calendar with Composio** — ChatAgent calls `link_composio` with `toolkit=googlecalendar` and texts you the Connect Link.
+2. Open the link, sign in with Google, approve.
+3. Ask about your calendar; ChatAgent spawns a worker with Composio meta tools. Connections persist per phone number (`user_id`) across restarts.
+4. **unlink composio** — revokes the connected account(s).
+
+Set `COMPOSIO_ENABLED=false` or leave `COMPOSIO_API_KEY` empty to skip Composio. Expand `COMPOSIO_TOOLKITS` with more slugs (e.g. `gmail`) without code changes.
+
 ## Project layout
 
 | Path               | Role                                                                                                                            |
 | ------------------ | ------------------------------------------------------------------------------------------------------------------------------- |
-| `app.py`           | FastAPI: `/health`, `/webhooks/register`, `/webhooks/receive`; wires adapters + MCP lifespan; ensures Sendblue webhook on start |
+| `app.py`           | FastAPI: `/health`, `/webhooks/register`, `/webhooks/receive`; wires adapters + MCP/Composio lifespan; Sendblue webhook on start |
 | `config.py`        | Settings from `.env`                                                                                                            |
 | `agents/`          | `Agent` ABC + `ChatAgent` (owns `SYSTEM_PROMPT`)                                                                                |
-| `tools/`           | `Tool` ABC, `ToolRegistry`, local tools (time, SnapTrade link/status/unlink)                                                    |
+| `tools/`           | `Tool` ABC, `ToolRegistry`, local tools (time, SnapTrade/Composio link helpers)                                                 |
 | `mcp_client/`      | Cursor-style `mcp.json` loader, multi-server hub, OAuth device flow + token store                                               |
+| `composio_hub/`    | Composio Sessions hub + Tool Router meta-tool adapters                                                                          |
 | `llm/`             | `LLMClient` ABC + `LlamaServerAdapter`                                                                                          |
 | `messaging/`       | `MessagingClient` ABC + `SendblueAdapter`                                                                                       |
 | `webhooks/`        | `SendblueWebhookHandler` (verify + receive + reply)                                                                             |

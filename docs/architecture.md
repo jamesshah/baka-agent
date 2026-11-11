@@ -15,6 +15,7 @@ flowchart TB
     Registry[ToolRegistry]
     LocalTools[Local tools]
     McpTools[MCP tools]
+    ComposioTools[Composio meta tools]
 
     subgraph memorySystem [Local memory system]
         Repository["SQLAlchemy repository"]
@@ -49,6 +50,7 @@ flowchart TB
     Executor --> Registry
     Registry --> LocalTools
     Registry --> McpTools
+    Registry --> ComposioTools
     Executor <--> ChatModel
     ToolLoop --> ChatAgent
     ChatAgent --> Sendblue
@@ -82,9 +84,10 @@ flowchart TB
    and recent connector events (FTS5 plus vectors, under bounded budgets)
    and attaches that block to the current user message only.
 4. The chat model replies directly, calls account link, status, and unlink
-   tools itself (SnapTrade and OAuth connectors), or delegates other tool
-   work to `ExecutorAgent`. An identical tool call is not run twice in the
-   same turn.
+   tools itself (SnapTrade, Whoop, and Composio/`link_composio`), or
+   delegates other tool work to `ExecutorAgent` (including Composio Tool
+   Router meta tools for Calendar reads). An identical tool call is not run
+   twice in the same turn.
 5. Replies go out through `deliver_replies` (markdown stripped, chunked for
    iMessage). The complete turn—including tool calls and results—is committed
    atomically to SQLite.
@@ -198,6 +201,24 @@ version v2. Set `WHOOP_CLIENT_ID`, `WHOOP_CLIENT_SECRET`, and
 `PUBLIC_BASE_URL`, then text the agent "link my Whoop". Tokens are stored under
 `MCP_OAUTH_DATA_DIR/whoop/`, and the Whoop user id to phone map in
 `MCP_OAUTH_DATA_DIR/whoop_accounts.json`.
+
+## Composio Sessions
+
+Composio is a third tool source beside local tools and MCP. On startup
+(`COMPOSIO_ENABLED` + `COMPOSIO_API_KEY`), `composio_hub.ComposioHub`
+creates a Tool Router session, discovers the meta-tool schemas, and registers
+them on `ToolRegistry` (worker tools). Each iMessage phone number maps to a
+Composio `user_id`; connections (e.g. Google Calendar) persist on Composio's
+side across agent restarts.
+
+Auth is Connect Link over iMessage: chat-agent `link_composio` (or worker
+`COMPOSIO_MANAGE_CONNECTIONS`) returns a `redirect_url`, the user approves in
+the browser, and later turns execute through `COMPOSIO_MULTI_EXECUTE_TOOL`.
+`COMPOSIO_TOOLKITS` (default `googlecalendar`) limits which apps the session
+may discover. Custom Google Cloud OAuth is not required — Composio-managed
+auth is the default. `link_composio` / `composio_status` / `unlink_composio`
+are chat-agent tools so "link my Calendar" does not get confused with
+`link_snaptrade`.
 
 ## Memory boundaries
 
