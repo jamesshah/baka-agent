@@ -36,6 +36,47 @@ def _serialize_result(result: Any) -> Any:
     return str(result)
 
 
+def _toolkit_item_connected(item: Any) -> bool:
+    """Whether a ``session.toolkits()`` row represents an active connection.
+
+    Composio's Tool Router returns ``ToolkitConnectionState`` with nested
+    ``connection.is_active`` (and optionally ``connection.connected_account``).
+    Older/dict shapes may use top-level ``is_connected`` / ``connected``.
+    """
+    if isinstance(item, dict):
+        connection = item.get("connection")
+        if isinstance(connection, dict):
+            if "is_active" in connection:
+                return bool(connection.get("is_active"))
+            account = connection.get("connected_account")
+            if isinstance(account, dict) and account.get("status"):
+                return str(account.get("status")).upper() == "ACTIVE"
+            if account:
+                return True
+        for key in ("is_connected", "connected", "is_active"):
+            if key in item and item.get(key) is not None:
+                return bool(item.get(key))
+        return False
+
+    connection = getattr(item, "connection", None)
+    if connection is not None:
+        is_active = getattr(connection, "is_active", None)
+        if is_active is not None:
+            return bool(is_active)
+        account = getattr(connection, "connected_account", None)
+        if account is not None:
+            status = getattr(account, "status", None)
+            if status is not None:
+                return str(status).upper() == "ACTIVE"
+            return True
+
+    for key in ("is_connected", "connected", "is_active"):
+        value = getattr(item, key, None)
+        if value is not None:
+            return bool(value)
+    return False
+
+
 def _openai_spec_parts(raw: Any) -> tuple[str, str, dict[str, Any]] | None:
     """Extract name/description/parameters from an OpenAI-style tool dict."""
     if not isinstance(raw, dict):
@@ -280,22 +321,21 @@ class ComposioHub:
         for item in items:
             if isinstance(item, dict):
                 slug = item.get("slug") or item.get("toolkit") or item.get("name")
-                is_connected = item.get("is_connected")
-                if is_connected is None:
-                    is_connected = item.get("connected")
                 connected.append(
                     {
                         "toolkit": slug,
-                        "connected": bool(is_connected),
+                        "connected": _toolkit_item_connected(item),
                         "raw": item,
                     }
                 )
             else:
                 slug = getattr(item, "slug", None) or getattr(item, "toolkit", None)
-                is_connected = getattr(item, "is_connected", None)
-                if is_connected is None:
-                    is_connected = getattr(item, "connected", False)
-                connected.append({"toolkit": slug, "connected": bool(is_connected)})
+                connected.append(
+                    {
+                        "toolkit": slug,
+                        "connected": _toolkit_item_connected(item),
+                    }
+                )
 
         if toolkit:
             toolkit_l = toolkit.strip().lower()

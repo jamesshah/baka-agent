@@ -2,9 +2,47 @@
 
 from __future__ import annotations
 
-from composio_hub.hub import _openai_spec_parts, _serialize_result
+from types import SimpleNamespace
+
+from composio_hub.hub import (
+    _openai_spec_parts,
+    _serialize_result,
+    _toolkit_item_connected,
+)
 from composio_hub.tool import ComposioTool
 from tools.registry import ToolRegistry
+
+
+def test_toolkit_item_connected_reads_nested_is_active() -> None:
+    # Shape returned by Composio session.toolkits() today.
+    active = SimpleNamespace(
+        slug="googlecalendar",
+        connection=SimpleNamespace(
+            is_active=True,
+            connected_account=SimpleNamespace(id="ca_x", status="ACTIVE"),
+        ),
+    )
+    inactive = SimpleNamespace(
+        slug="googlecalendar",
+        connection=SimpleNamespace(is_active=False, connected_account=None),
+    )
+    assert _toolkit_item_connected(active) is True
+    assert _toolkit_item_connected(inactive) is False
+    assert _toolkit_item_connected({"slug": "googlecalendar", "connected": True}) is True
+    assert (
+        _toolkit_item_connected(
+            {
+                "slug": "googlecalendar",
+                "connection": {
+                    "is_active": True,
+                    "connected_account": {"id": "ca_x", "status": "ACTIVE"},
+                },
+            }
+        )
+        is True
+    )
+    # Missing nested connection must not silently count as linked.
+    assert _toolkit_item_connected(SimpleNamespace(slug="googlecalendar")) is False
 
 
 def test_openai_spec_parts_from_function_tool() -> None:
