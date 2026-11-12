@@ -13,6 +13,7 @@ from fastapi import BackgroundTasks, FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from agents import ChatAgent, ExecutorAgent
+from composio_hub import ComposioHub
 from config import get_settings
 from connectors import ConnectorRegistry, OAuthConnector, build_connector_registry
 from events.digest import DigestScheduler, parse_digest_time
@@ -35,13 +36,16 @@ from memory import (
 from memory.migrate import upgrade as upgrade_database
 from messaging import SendblueAdapter
 from tools import (
+    ComposioStatusTool,
     GetCurrentTimeTool,
+    LinkComposioTool,
     LinkSnaptradeTool,
     ManageMemoryTool,
     SendAcknowledgementTool,
     SnaptradeStatusTool,
     SpawnAgentTool,
     ToolRegistry,
+    UnlinkComposioTool,
     UnlinkSnaptradeTool,
 )
 from tools.event_rules import ManageEventRulesTool
@@ -62,6 +66,7 @@ _llm = LlamaServerAdapter(
 )
 _tools = ToolRegistry()
 _mcp: MultiServerMcpClient | None = None
+_composio: ComposioHub | None = None
 _token_store = FileTokenStore(_settings.mcp_oauth_data_dir)
 _database = Database(_settings.database_path) if _settings.memory_enabled else None
 _memory_repository = (
@@ -298,6 +303,60 @@ def _mcp_health() -> dict[str, Any]:
     return _mcp.status()
 
 
+def _register_composio_tools(hub: ComposioHub) -> None:
+    for tool in hub.tools:
+        _tools.register(tool)
+    _tools.register(LinkComposioTool(hub))
+    _tools.register(ComposioStatusTool(hub))
+    _tools.register(UnlinkComposioTool(hub))
+    logger.info(
+        "Registered %d Composio meta tool(s) + link/status/unlink helpers",
+        len(hub.tools),
+    )
+
+
+def _start_composio() -> ComposioHub | None:
+    if not _settings.composio_enabled:
+        logger.info("Composio disabled via COMPOSIO_ENABLED=false")
+        return None
+    if not _settings.composio_api_key.strip():
+        logger.info("Composio skipped: COMPOSIO_API_KEY is empty")
+        return None
+
+    hub = ComposioHub(
+        api_key=_settings.composio_api_key,
+        toolkits=_settings.composio_toolkit_list,
+    )
+    hub.start()
+    _register_composio_tools(hub)
+    return hub
+
+
+def _composio_health() -> dict[str, Any]:
+    if not _settings.composio_enabled:
+        return {
+            "status": "disabled",
+            "toolkits": _settings.composio_toolkit_list,
+            "tool_count": 0,
+            "detail": "COMPOSIO_ENABLED=false",
+        }
+    if not _settings.composio_api_key.strip():
+        return {
+            "status": "unconfigured",
+            "toolkits": _settings.composio_toolkit_list,
+            "tool_count": 0,
+            "detail": "COMPOSIO_API_KEY is empty",
+        }
+    if _composio is None:
+        return {
+            "status": "error",
+            "toolkits": _settings.composio_toolkit_list,
+            "tool_count": 0,
+            "detail": "Composio startup failed",
+        }
+    return _composio.status()
+
+
 def _overall_status(checks: dict[str, dict[str, Any]]) -> str:
     statuses = [check.get("status", "error") for check in checks.values()]
     if any(s == "error" for s in statuses):
@@ -309,7 +368,7 @@ def _overall_status(checks: dict[str, dict[str, Any]]) -> str:
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
-    global _mcp
+    global _mcp, _composio
     if _settings.memory_enabled:
         upgrade_database(_settings.database_path)
         indexed = _skill_indexer.sync() if _skill_indexer is not None else 0
@@ -319,6 +378,12 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     except Exception:  # noqa: BLE001 — app should still serve without MCP
         logger.exception("MCP startup failed; continuing without MCP tools")
         _mcp = None
+
+    try:
+        _composio = _start_composio()
+    except Exception:  # noqa: BLE001 — app should still serve without Composio
+        logger.exception("Composio startup failed; continuing without Composio tools")
+        _composio = None
 
     try:
         result = _messaging.ensure_receive_webhook(
@@ -352,6 +417,9 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         _digest.stop()
     if _event_processor is not None:
         _event_processor.stop()
+    if _composio is not None:
+        _composio.stop()
+        _composio = None
     if _mcp is not None:
         _mcp.stop()
         _mcp = None
@@ -459,6 +527,7 @@ def health() -> JSONResponse:
         "agents": agents_check,
         "memory": memory_check,
         "mcp": mcp_check,
+        "composio": _composio_health(),
         "model": model_check,
         "sendblue_webhook": webhook_check,
         "connectors": _connectors_health(),
