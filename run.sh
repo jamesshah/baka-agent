@@ -10,12 +10,17 @@
 #   ./run.sh migrate [current|history]
 #
 # Optional env overrides (shell env wins over .env; only these keys are read from .env):
-#   LLAMA_HF_REPO   Hugging Face model for llama-server -hf (default below)
-#   LLAMA_CACHE     llama.cpp HF download cache dir (default: LLAMA_HF_REPO sans :quant)
-#   LLAMA_CACHE_RAM host-RAM prompt cache in MiB (default 2048; llama.cpp default is 8192)
-#   LLAMA_PORT      llama-server port (default 8080)
-#   AGENT_HOST      uvicorn host (default 0.0.0.0)
-#   AGENT_PORT      uvicorn port (default 8000)
+#   LLAMA_HF_REPO    Hugging Face model for llama-server -hf (default below)
+#   LLAMA_CACHE      llama.cpp HF download cache dir (default: LLAMA_HF_REPO sans :quant)
+#   LLAMA_CACHE_RAM  host-RAM prompt cache in MiB (default 1024; llama.cpp default is 8192)
+#   LLAMA_CTX_SIZE   context window (default 16384; Gemma 12B on 24 GB)
+#   LLAMA_TEMP       sampling temperature (default 1.0)
+#   LLAMA_TOP_P      top-p (default 0.95)
+#   LLAMA_TOP_K      top-k (default 64)
+#   LLAMA_REASONING  llama.cpp --reasoning: on|off|auto (default auto)
+#   LLAMA_PORT       llama-server port (default 8080)
+#   AGENT_HOST       uvicorn host (default 0.0.0.0)
+#   AGENT_PORT       uvicorn port (default 8000)
 
 set -euo pipefail
 
@@ -64,6 +69,10 @@ dotenv_get LLAMA_HF_REPO
 dotenv_get LLAMA_CTX_SIZE
 dotenv_get LLAMA_CACHE
 dotenv_get LLAMA_CACHE_RAM
+dotenv_get LLAMA_TEMP
+dotenv_get LLAMA_TOP_P
+dotenv_get LLAMA_TOP_K
+dotenv_get LLAMA_REASONING
 dotenv_get LLAMA_PORT
 dotenv_get EMBEDDING_HF_REPO
 dotenv_get EMBEDDING_CACHE
@@ -72,12 +81,17 @@ dotenv_get AGENT_HOST
 dotenv_get AGENT_PORT
 
 # Defaults when neither shell env nor .env set the value.
-LLAMA_HF_REPO="${LLAMA_HF_REPO:-unsloth/gemma-4-E2B-it-GGUF:BF16}"
-LLAMA_CTX_SIZE="${LLAMA_CTX_SIZE:-100000}"
-# Default download cache = HF repo id without :quant (e.g. unsloth/Muse-Glimmer-30B-GGUF).
+LLAMA_HF_REPO="${LLAMA_HF_REPO:-unsloth/gemma-4-12b-it-GGUF:UD-Q4_K_XL}"
+LLAMA_CTX_SIZE="${LLAMA_CTX_SIZE:-16384}"
+# Default download cache = HF repo id without :quant (e.g. unsloth/gemma-4-12b-it-GGUF).
 LLAMA_CACHE="${LLAMA_CACHE:-${LLAMA_HF_REPO%%:*}}"
-# 2 GiB is safer on 24 GB unified-memory Macs than llama.cpp's 8 GiB default.
+# 1 GiB is safer on 24 GB unified-memory Macs than llama.cpp's 8 GiB default.
 LLAMA_CACHE_RAM="${LLAMA_CACHE_RAM:-1024}"
+# Gemma 4 IT sampling defaults (override in .env for other models).
+LLAMA_TEMP="${LLAMA_TEMP:-1.0}"
+LLAMA_TOP_P="${LLAMA_TOP_P:-0.95}"
+LLAMA_TOP_K="${LLAMA_TOP_K:-64}"
+LLAMA_REASONING="${LLAMA_REASONING:-auto}"
 LLAMA_PORT="${LLAMA_PORT:-8080}"
 EMBEDDING_HF_REPO="${EMBEDDING_HF_REPO:-nomic-ai/nomic-embed-text-v1.5-GGUF:Q4_K_M}"
 EMBEDDING_CACHE="${EMBEDDING_CACHE:-${EMBEDDING_HF_REPO%%:*}}"
@@ -147,16 +161,19 @@ start_llama() {
 
   echo "Starting llama-server (-hf ${LLAMA_HF_REPO} --port ${LLAMA_PORT})…"
   echo "  LLAMA_CACHE=${LLAMA_CACHE}"
+  echo "  temp=${LLAMA_TEMP} top_p=${LLAMA_TOP_P} top_k=${LLAMA_TOP_K} reasoning=${LLAMA_REASONING}"
   # --jinja: chat templates / tool calling.
+  # --reasoning: on|off|auto (Gemma default auto; set off for non-thinking models).
   # --cache-prompt: reuse KV for matching prompt prefixes (default on; set explicitly).
   # --cache-ram: host-RAM prompt-cache budget in MiB (default 8192).
   nohup llama-server \
     -hf "${LLAMA_HF_REPO}" \
     --port "${LLAMA_PORT}" \
     --ctx-size "${LLAMA_CTX_SIZE}" \
-    --temp 1.0 \
-    --top-p 0.95 \
-    --top-k 64 \
+    --temp "${LLAMA_TEMP}" \
+    --top-p "${LLAMA_TOP_P}" \
+    --top-k "${LLAMA_TOP_K}" \
+    --reasoning "${LLAMA_REASONING}" \
     --jinja \
     --cache-prompt \
     -fa 1 \
@@ -404,13 +421,18 @@ Examples:
   ./run.sh start            # start both
 
 Optional env overrides (shell env wins; else .env; else defaults):
-  LLAMA_HF_REPO   Hugging Face model for llama-server -hf
-  LLAMA_CACHE     HF download cache dir (default: LLAMA_HF_REPO without :quant)
-  LLAMA_PORT      llama-server port (default 8080)
+  LLAMA_HF_REPO     Hugging Face model for llama-server -hf
+  LLAMA_CACHE       HF download cache dir (default: LLAMA_HF_REPO without :quant)
+  LLAMA_CTX_SIZE    context window (default 16384)
+  LLAMA_TEMP        temperature (default 1.0)
+  LLAMA_TOP_P       top-p (default 0.95)
+  LLAMA_TOP_K       top-k (default 64)
+  LLAMA_REASONING   --reasoning on|off|auto (default auto)
+  LLAMA_PORT        llama-server port (default 8080)
   EMBEDDING_HF_REPO embedding GGUF for the sidecar
-  EMBEDDING_PORT  embedding server port (default 8081)
-  AGENT_HOST      uvicorn host (default 0.0.0.0)
-  AGENT_PORT      uvicorn port (default 8000)
+  EMBEDDING_PORT    embedding server port (default 8081)
+  AGENT_HOST        uvicorn host (default 0.0.0.0)
+  AGENT_PORT        uvicorn port (default 8000)
 EOF
 }
 

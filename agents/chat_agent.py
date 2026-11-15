@@ -40,12 +40,17 @@ Format: plain iMessage-friendly text. Keep replies under ~400 chars when you can
 
 When to reply yourself:
 Answer small talk, simple questions, and anything you can handle from the conversation (including photos you can see) without tools.
-To link, check, or unlink a connected account (e.g. SnapTrade, Whoop), call its link_*, *_status, or unlink_* tool yourself and text the user the link or result. No acknowledgement or spawn_agent needed.
+To link, check, or unlink an account, call the matching tool yourself and text the user the link or result. No acknowledgement or spawn_agent needed.
+Pick the right link tool — do not guess:
+- Google Calendar / Gmail / Composio / "Compose" → link_composio (toolkit googlecalendar), composio_status, unlink_composio
+- SnapTrade / brokerage / portfolio → link_snaptrade, snaptrade_status, unlink_snaptrade
+- Whoop → link_whoop, whoop_status, unlink_whoop
+Never call link_snaptrade for Calendar, and never call link_composio for portfolio.
 
 When to delegate:
-If the request needs other tools, lookups, or extended reasoning, do not answer it yourself.
+If the request needs other tools, lookups, reading Calendar after it is linked (COMPOSIO_* worker tools), or extended reasoning, do not answer it yourself.
 1. Call send_acknowledgement with a short iMessage-style ping. Make it short and sweet but don't be too generic or robotic. 
-2. Call spawn_agent with a complete task description and the worker tool names this task needs (from the catalog below). Use an empty tools list for reasoning-only work. The worker has no chat history — put every fact and instruction it needs in task. Grant only the tools required for this task.
+2. Call spawn_agent with a complete task description and the worker tool names this task needs (from the catalog below). Use an empty tools list for reasoning-only work. The worker has no chat history — put every fact and instruction it needs in task. Grant only the tools required for this task. For Calendar reads after linking, grant COMPOSIO_SEARCH_TOOLS, COMPOSIO_MANAGE_CONNECTIONS, COMPOSIO_MULTI_EXECUTE_TOOL (and related COMPOSIO_* tools).
 Prefer calling both tools in the same turn. 
 NEVER CALL spawn_agent WITHOUT ACKNOWLEDGING FIRST.
 

@@ -52,6 +52,12 @@ class Settings(BaseSettings):
     mcp_oauth_data_dir: str = ".data/mcp-oauth"
     mcp_oauth_owner_number: str = ""
 
+    # Composio Sessions (Tool Router) — managed SaaS tools without per-app MCP.
+    composio_enabled: bool = True
+    composio_api_key: str = ""
+    # Comma-separated toolkit slugs the session may discover/use.
+    composio_toolkits: str = "googlecalendar"
+
     # Public origin of this server (tunnel host), e.g. https://xxxx.trycloudflare.com.
     # Connector webhooks arrive at <public_base_url>/webhooks/connectors/<name>.
     public_base_url: str = ""
@@ -97,6 +103,17 @@ class Settings(BaseSettings):
         if len(allowed) == 1:
             return next(iter(allowed))
         return ""
+
+    @property
+    def composio_toolkit_list(self) -> list[str]:
+        """Parsed COMPOSIO_TOOLKITS allowlist (empty = unrestricted catalog)."""
+        if not self.composio_toolkits.strip():
+            return []
+        return [
+            slug.strip()
+            for slug in self.composio_toolkits.split(",")
+            if slug.strip()
+        ]
 
 
 @lru_cache

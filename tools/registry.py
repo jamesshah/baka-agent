@@ -32,13 +32,14 @@ class ToolRegistry:
         return sorted(tool.name for tool in self._iter_tools(chat_agent=chat_agent))
 
     def local_names(self, *, chat_agent: bool | None = None) -> list[str]:
-        """Names of non-MCP (locally defined) tools only."""
+        """Names of locally defined tools only (excludes MCP + Composio adapters)."""
+        from composio_hub.tool import ComposioTool
         from mcp_client.tool import McpTool
 
         return sorted(
             tool.name
             for tool in self._iter_tools(chat_agent=chat_agent)
-            if not isinstance(tool, McpTool)
+            if not isinstance(tool, (McpTool, ComposioTool))
         )
 
     def count(self, *, chat_agent: bool | None = None) -> int:
