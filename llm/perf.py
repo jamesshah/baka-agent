@@ -9,6 +9,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from log_redact import redact_data
+
 logger = logging.getLogger(__name__)
 
 PERF_LOG_PATH = Path(__file__).resolve().parent.parent / ".run" / "logs" / "llm-perf.jsonl"
@@ -264,7 +266,7 @@ def n_ctx_from_props(props: dict[str, Any] | None) -> int | None:
 
 def _append_jsonl(metrics: dict[str, Any], path: Path) -> None:
     global _path_logged
-    line = json.dumps(metrics, default=str, separators=(",", ":"))
+    line = json.dumps(redact_data(metrics), default=str, separators=(",", ":"))
     with _lock:
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as handle:
