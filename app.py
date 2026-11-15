@@ -22,6 +22,7 @@ from events.processor import EventProcessor
 from events.rules import RuleEngine
 from events.triage import EventTriage, parse_quiet_hours
 from llm import LlamaServerAdapter
+from log_redact import configure_logging
 from mcp_client import MultiServerMcpClient, load_mcp_config
 from mcp_client.token_store import FileTokenStore
 from memory import (
@@ -53,10 +54,7 @@ from tools.events import connector_tools
 from webhooks import SendblueWebhookHandler
 from webhooks.connectors import ConnectorWebhookHandler
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
-)
+configure_logging()
 logger = logging.getLogger(__name__)
 
 _settings = get_settings()
@@ -369,6 +367,8 @@ def _overall_status(checks: dict[str, dict[str, Any]]) -> str:
 @asynccontextmanager
 async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     global _mcp, _composio
+    # Uvicorn installs its own handlers before import; wrap any added since.
+    configure_logging()
     if _settings.memory_enabled:
         upgrade_database(_settings.database_path)
         indexed = _skill_indexer.sync() if _skill_indexer is not None else 0
