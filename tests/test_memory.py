@@ -16,6 +16,7 @@ from sqlalchemy import inspect
 from starlette.requests import Request
 
 from agents.chat_agent import ChatAgent
+from agents.history import align_messages_to_user
 from config import Settings
 from llm.base import LLMClient
 from memory.database import Database
@@ -231,6 +232,72 @@ class MemoryTestCase(unittest.TestCase):
         ).render("+15550000001", "help with python")
         self.assertIn("python-helper", context)
         self.assertIn("Inspect the traceback", context)
+
+    def test_align_messages_to_user_drops_leading_non_user(self) -> None:
+        aligned = align_messages_to_user([
+            {"role": "tool", "content": "orphan"},
+            {"role": "user", "content": "hi"},
+        ])
+        self.assertEqual(["user"], [m["role"] for m in aligned])
+        self.assertEqual([], align_messages_to_user([{"role": "tool", "content": "x"}]))
+
+    def test_trim_history_drops_lone_orphan_tool(self) -> None:
+        agent = ChatAgent(
+            FakeLLM(),
+            ToolRegistry(),
+            max_history_messages=4,
+        )
+        history: list[dict[str, Any]] = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "u1"},
+            {"role": "assistant", "content": "a1"},
+            {"role": "tool", "content": "t1", "tool_call_id": "c1"},
+            {"role": "user", "content": "u2"},
+            {"role": "assistant", "content": "a2"},
+            {"role": "tool", "content": "t2", "tool_call_id": "c2"},
+        ]
+        agent._trim_history(history)
+        roles = [m["role"] for m in history]
+        self.assertEqual("system", roles[0])
+        if len(roles) > 1:
+            self.assertEqual("user", roles[1])
+
+    def test_chat_agent_hydrate_aligns_orphan_tool_from_load(self) -> None:
+        self.repository.begin_turn(
+            "+15550000001",
+            "turn-hydrate",
+            {"role": "user", "content": "question", "turn_id": "turn-hydrate"},
+        )
+        self.repository.complete_turn(
+            "turn-hydrate",
+            [
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "turn_id": "turn-hydrate",
+                    "tool_calls": [{"id": "call-1", "type": "function", "function": {"name": "x", "arguments": "{}"}}],
+                },
+                {
+                    "role": "tool",
+                    "content": "result",
+                    "turn_id": "turn-hydrate",
+                    "tool_call_id": "call-1",
+                },
+            ],
+        )
+        raw = self.repository.load_history("+15550000001", limit=1)
+        self.assertEqual(["tool"], [m["role"] for m in raw])
+        agent = ChatAgent(
+            FakeLLM(),
+            ToolRegistry(),
+            memory_repository=self.repository,
+            max_history_messages=2,
+        )
+        history = agent._history_unlocked("+15550000001")
+        self.assertEqual(
+            ["system"],
+            [m["role"] for m in history],
+        )
 
     def test_chat_agent_hydrates_and_commits_history(self) -> None:
         agent = ChatAgent(
