@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import threading
 from collections.abc import Callable
-from datetime import date, datetime, time, tzinfo
+from datetime import datetime, time, tzinfo
 from typing import TYPE_CHECKING
 
 from events.triage import in_quiet_hours, local_now
@@ -31,10 +31,13 @@ def parse_digest_time(value: str) -> time | None:
 
 class DigestScheduler:
     """
-    Once per local day at ``digest_time``, send pending digest events.
+    After ``digest_time`` each local day, send pending digest events.
 
-    If the app was down at digest time it catches up on the next check that
-    day (outside quiet hours) rather than dropping the digest.
+    Events that arrive before digest time accumulate into that day's batch.
+    Events that arrive after digest time (or after today's batch already
+    went out) are flushed on the next check instead of waiting until
+    tomorrow. If the app was down at digest time it catches up on the next
+    check that day (outside quiet hours) rather than dropping the digest.
     """
 
     def __init__(
@@ -54,7 +57,6 @@ class DigestScheduler:
         self._quiet_hours = quiet_hours
         self._clock = clock or (lambda: local_now(tz))
         self._check_interval_s = check_interval_s
-        self._last_run: date | None = None
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
@@ -87,26 +89,23 @@ class DigestScheduler:
         """Send due digests; return how many users were messaged."""
         now = now or self._clock()
         with self._lock:
-            if self._last_run == now.date():
-                return 0
             if now.timetz().replace(tzinfo=None) < self._digest_time:
                 return 0
             if in_quiet_hours(now, self._quiet_hours):
                 return 0
-            self._last_run = now.date()
 
-        sent = 0
-        for phone in self._repository.principals_with_pending_digest():
-            events = self._repository.pending_digest(phone)
-            if not events:
-                continue
-            try:
-                self._notifier(phone, events, True)
-            except Exception:  # noqa: BLE001 — leave them pending for tomorrow
-                logger.exception("failed to send digest to %s", phone)
-                continue
-            for event in events:
-                self._repository.update_event(event.id, status="digested")
-            sent += 1
-            logger.info("sent digest of %d event(s) to %s", len(events), phone)
-        return sent
+            sent = 0
+            for phone in self._repository.principals_with_pending_digest():
+                events = self._repository.pending_digest(phone)
+                if not events:
+                    continue
+                try:
+                    self._notifier(phone, events, True)
+                except Exception:  # noqa: BLE001 — leave them pending for tomorrow
+                    logger.exception("failed to send digest to %s", phone)
+                    continue
+                for event in events:
+                    self._repository.update_event(event.id, status="digested")
+                sent += 1
+                logger.info("sent digest of %d event(s) to %s", len(events), phone)
+            return sent
