@@ -38,6 +38,30 @@ class CountingTool(Tool):
         return f"count={self.calls}"
 
 
+class ChatCountingTool(CountingTool):
+    name = "chat_counter"
+
+    def is_chat_agent_tool(self) -> bool:
+        return True
+
+
+class WorkerOnlyTool(Tool):
+    name = "worker_secret"
+    description = "Worker-only side effect."
+    parameters: dict[str, Any] = {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": False,
+    }
+
+    def __init__(self) -> None:
+        self.ran = False
+
+    def execute(self, **kwargs: Any) -> str:
+        self.ran = True
+        return "leaked"
+
+
 class ScriptedLLM(LLMClient):
     """Return the scripted tool calls in order, then a final text reply."""
 
@@ -94,6 +118,46 @@ class RepeatedToolCallTests(unittest.TestCase):
 
         self.assertEqual(tool.calls, 2)
         self.assertEqual(replies, ["done"])
+
+
+class ChatToolScopeTests(unittest.TestCase):
+    def _chat_registry(self, registry: ToolRegistry) -> ToolRegistry:
+        return registry.view(registry.names(chat_agent=True), worker_only=False)
+
+    def test_worker_tool_refused_in_chat_scoped_loop(self) -> None:
+        worker = WorkerOnlyTool()
+        registry = ToolRegistry()
+        registry.register(ChatCountingTool())
+        registry.register(worker)
+        llm = ScriptedLLM([("worker_secret", {})])
+        history: list[dict[str, Any]] = [{"role": "user", "content": "hi"}]
+        chat_registry = self._chat_registry(registry)
+
+        list(run_tool_loop(
+            llm, history, chat_registry, session_id="+15550000000",
+            max_iterations=5,
+        ))
+
+        self.assertFalse(worker.ran)
+        tool_results = [m["content"] for m in history if m["role"] == "tool"]
+        self.assertEqual(tool_results, ["Unknown tool: worker_secret"])
+
+    def test_chat_tool_runs_in_chat_scoped_loop(self) -> None:
+        registry = ToolRegistry()
+        registry.register(ChatCountingTool())
+        registry.register(WorkerOnlyTool())
+        llm = ScriptedLLM([("chat_counter", {"n": 1})])
+        history: list[dict[str, Any]] = [{"role": "user", "content": "hi"}]
+        chat_registry = self._chat_registry(registry)
+
+        replies = list(run_tool_loop(
+            llm, history, chat_registry, session_id="+15550000000",
+            max_iterations=5,
+        ))
+
+        self.assertEqual(replies, ["done"])
+        tool_results = [m["content"] for m in history if m["role"] == "tool"]
+        self.assertEqual(tool_results, ["count=1"])
 
 
 class ConnectorToolScopeTests(unittest.TestCase):

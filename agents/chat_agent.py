@@ -312,13 +312,17 @@ class ChatAgent(Agent):
                     yield _FALLBACK_ACK
 
             chat_timeout = _MEDIA_CHAT_TIMEOUT_S if media is not None else None
+            chat_tools = self._tools.view(
+                self._tools.names(chat_agent=True),
+                worker_only=False,
+            )
             yield from run_tool_loop(
                 self._llm,
                 working,
-                self._tools,
+                chat_tools,
                 session_id=session_id,
                 max_iterations=self._max_agent_iterations,
-                tool_specs=self._tools.specs(chat_agent=True),
+                tool_specs=chat_tools.specs(),
                 timeout=chat_timeout,
                 label="chat",
                 turn_id=turn_id,
