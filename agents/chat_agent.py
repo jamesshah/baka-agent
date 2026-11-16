@@ -10,6 +10,7 @@ from collections.abc import Iterator, Sequence
 from typing import TYPE_CHECKING, Any
 
 from agents.base import Agent
+from agents.history import align_messages_to_user
 from agents.loop import run_tool_loop
 from events.format import event_context_query, format_event_message
 from llm.base import LLMClient
@@ -99,6 +100,7 @@ class ChatAgent(Agent):
                 if self._memory_repository is not None
                 else []
             )
+            loaded = align_messages_to_user(loaded)
             self._histories[session_id] = [{
                 "role": "system",
                 "content": self._render_system_prompt(),
@@ -115,9 +117,9 @@ class ChatAgent(Agent):
         if len(history) <= max_msgs:
             return
         system = history[0]
-        rest = history[1:][-max(1, max_msgs // 2):]
-        while len(rest) > 1 and rest[0].get("role") != "user":
-            rest.pop(0)
+        rest = align_messages_to_user(
+            history[1:][-max(1, max_msgs // 2):]
+        )
         history[:] = [system, *rest]
 
     def clear_history(self, session_id: str | None = None) -> None:
