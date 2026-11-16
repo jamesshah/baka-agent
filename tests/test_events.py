@@ -330,6 +330,28 @@ class DigestTests(EventPipelineCase):
         self.assertEqual({"digested"}, {e.status for e in self.repository.recent_events(PHONE)})
         self.assertEqual(0, scheduler.run_once(CHICAGO_NOON + timedelta(hours=1)))
 
+    def test_digest_events_arriving_after_digest_time_send_immediately(self) -> None:
+        """Late connector events must not wait until tomorrow's digest slot."""
+        self.llm.content = '{"action": "digest", "reason": "routine"}'
+        scheduler = DigestScheduler(
+            self.repository,
+            self.notifier,
+            digest_time=time(8, 30),
+            quiet_hours=parse_quiet_hours("22-7"),
+        )
+
+        # Today's digest slot already fired (possibly with nothing pending).
+        self.assertEqual(0, scheduler.run_once(CHICAGO_NOON.replace(hour=8, minute=30)))
+
+        self.processor.process_delivery(self.deliver("late-sleep", recovery_score=70))
+        self.assertEqual([("digest_pending", "llm")], self.statuses())
+
+        self.assertEqual(1, scheduler.run_once(CHICAGO_NOON.replace(hour=9)))
+        phone, events, digest = self.notifier.calls[-1]
+        self.assertEqual((PHONE, 1, True), (phone, len(events), digest))
+        self.assertIn("late-sleep", events[0].dedupe_key)
+        self.assertEqual({"digested"}, {e.status for e in self.repository.recent_events(PHONE)})
+
 
 class WhoopConnectorTests(unittest.TestCase):
     BODY = b'{"user_id":456,"id":"abc","type":"sleep.updated","trace_id":"t1"}'
