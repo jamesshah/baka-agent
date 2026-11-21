@@ -73,6 +73,10 @@ dotenv_get LLAMA_TEMP
 dotenv_get LLAMA_TOP_P
 dotenv_get LLAMA_TOP_K
 dotenv_get LLAMA_REASONING
+dotenv_get LLAMA_REPEAT_PENALTY
+dotenv_get LLAMA_KV_CACHE_TYPE
+dotenv_get LLAMA_REASONING_PRESERVE
+dotenv_get LLAMA_VERBOSE_PROMPT
 dotenv_get LLAMA_PORT
 dotenv_get EMBEDDING_HF_REPO
 dotenv_get EMBEDDING_CACHE
@@ -88,10 +92,17 @@ LLAMA_CACHE="${LLAMA_CACHE:-${LLAMA_HF_REPO%%:*}}"
 # 1 GiB is safer on 24 GB unified-memory Macs than llama.cpp's 8 GiB default.
 LLAMA_CACHE_RAM="${LLAMA_CACHE_RAM:-1024}"
 # Gemma 4 IT sampling defaults (override in .env for other models).
-LLAMA_TEMP="${LLAMA_TEMP:-1.0}"
-LLAMA_TOP_P="${LLAMA_TOP_P:-0.95}"
-LLAMA_TOP_K="${LLAMA_TOP_K:-64}"
-LLAMA_REASONING="${LLAMA_REASONING:-auto}"
+# Unset => Gemma default; set but empty => omit the flag (GGUF/server default).
+LLAMA_TEMP="${LLAMA_TEMP-1.0}"
+LLAMA_TOP_P="${LLAMA_TOP_P-0.95}"
+LLAMA_TOP_K="${LLAMA_TOP_K-64}"
+LLAMA_REASONING="${LLAMA_REASONING-auto}"
+# Optional: only passed when set.
+LLAMA_REPEAT_PENALTY="${LLAMA_REPEAT_PENALTY:-}"
+# KV cache type for -ctk/-ctv (q8_0 default; f16; empty disables both flags).
+LLAMA_KV_CACHE_TYPE="${LLAMA_KV_CACHE_TYPE-q8_0}"
+LLAMA_REASONING_PRESERVE="${LLAMA_REASONING_PRESERVE:-}"
+LLAMA_VERBOSE_PROMPT="${LLAMA_VERBOSE_PROMPT:-}"
 LLAMA_PORT="${LLAMA_PORT:-8080}"
 EMBEDDING_HF_REPO="${EMBEDDING_HF_REPO:-nomic-ai/nomic-embed-text-v1.5-GGUF:Q4_K_M}"
 EMBEDDING_CACHE="${EMBEDDING_CACHE:-${EMBEDDING_HF_REPO%%:*}}"
@@ -161,28 +172,32 @@ start_llama() {
 
   echo "Starting llama-server (-hf ${LLAMA_HF_REPO} --port ${LLAMA_PORT})…"
   echo "  LLAMA_CACHE=${LLAMA_CACHE}"
-  echo "  temp=${LLAMA_TEMP} top_p=${LLAMA_TOP_P} top_k=${LLAMA_TOP_K} reasoning=${LLAMA_REASONING}"
+  local -a llama_args=(
+    -hf "${LLAMA_HF_REPO}"
+    --port "${LLAMA_PORT}"
+    --ctx-size "${LLAMA_CTX_SIZE}"
+  )
+  [[ -n "${LLAMA_TEMP}" ]] && llama_args+=(--temp "${LLAMA_TEMP}")
+  [[ -n "${LLAMA_TOP_P}" ]] && llama_args+=(--top-p "${LLAMA_TOP_P}")
+  [[ -n "${LLAMA_TOP_K}" ]] && llama_args+=(--top-k "${LLAMA_TOP_K}")
+  [[ -n "${LLAMA_REPEAT_PENALTY}" ]] && llama_args+=(--repeat-penalty "${LLAMA_REPEAT_PENALTY}")
+  [[ -n "${LLAMA_REASONING}" ]] && llama_args+=(--reasoning "${LLAMA_REASONING}")
+  llama_args+=(--jinja --cache-prompt -fa 1 -ngl 99)
+  [[ -n "${LLAMA_KV_CACHE_TYPE}" ]] && llama_args+=(-ctk "${LLAMA_KV_CACHE_TYPE}" -ctv "${LLAMA_KV_CACHE_TYPE}")
+  case "$(printf '%s' "${LLAMA_REASONING_PRESERVE}" | tr '[:upper:]' '[:lower:]')" in
+    false|0|no|off) llama_args+=(--no-reasoning-preserve) ;;
+  esac
+  case "$(printf '%s' "${LLAMA_VERBOSE_PROMPT}" | tr '[:upper:]' '[:lower:]')" in
+    true|1|yes|on) llama_args+=(--verbose-prompt) ;;
+  esac
+  llama_args+=(--cache-ram "${LLAMA_CACHE_RAM}" --slots)
+
+  echo "  temp=${LLAMA_TEMP:-<server>} top_p=${LLAMA_TOP_P:-<server>} top_k=${LLAMA_TOP_K:-<server>} repeat_penalty=${LLAMA_REPEAT_PENALTY:-<server>} reasoning=${LLAMA_REASONING:-<server>} kv_cache=${LLAMA_KV_CACHE_TYPE:-<server>}"
   # --jinja: chat templates / tool calling.
   # --reasoning: on|off|auto (Gemma default auto; set off for non-thinking models).
   # --cache-prompt: reuse KV for matching prompt prefixes (default on; set explicitly).
   # --cache-ram: host-RAM prompt-cache budget in MiB (default 8192).
-  nohup llama-server \
-    -hf "${LLAMA_HF_REPO}" \
-    --port "${LLAMA_PORT}" \
-    --ctx-size "${LLAMA_CTX_SIZE}" \
-    --temp "${LLAMA_TEMP}" \
-    --top-p "${LLAMA_TOP_P}" \
-    --top-k "${LLAMA_TOP_K}" \
-    --reasoning "${LLAMA_REASONING}" \
-    --jinja \
-    --cache-prompt \
-    -fa 1 \
-    -ngl 99 \
-    -ctk q8_0 \
-    -ctv q8_0 \
-    --cache-ram "${LLAMA_CACHE_RAM}" \
-    --slots \
-    >>"${LLAMA_LOG}" 2>&1 &
+  nohup llama-server "${llama_args[@]}" >>"${LLAMA_LOG}" 2>&1 &
   echo $! >"${LLAMA_PID_FILE}"
   echo "  pid $(cat "${LLAMA_PID_FILE}")  log ${LLAMA_LOG}"
   wait_for_url "${LLAMA_HEALTH_URL}" "llama-server" 120
@@ -428,6 +443,11 @@ Optional env overrides (shell env wins; else .env; else defaults):
   LLAMA_TOP_P       top-p (default 0.95)
   LLAMA_TOP_K       top-k (default 64)
   LLAMA_REASONING   --reasoning on|off|auto (default auto)
+  (LLAMA_TEMP/TOP_P/TOP_K/REASONING: set to empty to omit the flag)
+  LLAMA_REPEAT_PENALTY    --repeat-penalty (only passed if set)
+  LLAMA_KV_CACHE_TYPE     -ctk/-ctv type (default q8_0; f16; empty = omit)
+  LLAMA_REASONING_PRESERVE  false => --no-reasoning-preserve
+  LLAMA_VERBOSE_PROMPT    true => --verbose-prompt
   LLAMA_PORT        llama-server port (default 8080)
   EMBEDDING_HF_REPO embedding GGUF for the sidecar
   EMBEDDING_PORT    embedding server port (default 8081)

@@ -26,6 +26,10 @@ class LlamaServerAdapter(LLMClient):
         model: str,
         *,
         timeout: float = 120.0,
+        temperature: float | None = None,
+        top_p: float | None = None,
+        top_k: int | None = None,
+        repeat_penalty: float | None = None,
     ) -> None:
         self._base_url = base_url.rstrip("/")
         self._model = model
@@ -33,6 +37,14 @@ class LlamaServerAdapter(LLMClient):
         self._modalities: set[str] | None = None
         self._modalities_fetched_at = 0.0
         self._n_ctx: int | None = None
+        self._runtime: dict[str, Any] | None = None
+        # Client-side sampling defaults; None = omit so llama-server flags govern.
+        self._sampling_defaults: dict[str, Any] = {
+            "temperature": temperature,
+            "top_p": top_p,
+            "top_k": top_k,
+            "repeat_penalty": repeat_penalty,
+        }
 
     @property
     def base_url(self) -> str:
@@ -78,6 +90,7 @@ class LlamaServerAdapter(LLMClient):
                 "model": self._model,
                 "checked_url": checked_url,
                 "input_modalities": sorted(modalities_set),
+                "runtime": self._refresh_runtime(client),
                 **served,
                 **prompt_cache,
             }
@@ -193,15 +206,28 @@ class LlamaServerAdapter(LLMClient):
         self,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
-        temperature: float = 0.7,
+        temperature: float | None = None,
         timeout: float | None = None,
+        top_p: float | None = None,
+        top_k: int | None = None,
+        repeat_penalty: float | None = None,
     ) -> dict[str, Any]:
         url = f"{self._base_url}/chat/completions"
         payload: dict[str, Any] = {
             "model": self._model,
             "messages": messages,
-            "temperature": temperature,
         }
+        overrides = {
+            "temperature": temperature,
+            "top_p": top_p,
+            "top_k": top_k,
+            "repeat_penalty": repeat_penalty,
+        }
+        for key, value in overrides.items():
+            if value is None:
+                value = self._sampling_defaults.get(key)
+            if value is not None:
+                payload[key] = value
         if tools:
             payload["tools"] = tools
 
@@ -249,6 +275,57 @@ class LlamaServerAdapter(LLMClient):
         if n_ctx:
             self._n_ctx = n_ctx
         return n_ctx
+
+    @property
+    def runtime_config(self) -> dict[str, Any] | None:
+        """Last /props runtime summary captured by health_check (no network)."""
+        return self._runtime
+
+    def _refresh_runtime(self, client: httpx.Client) -> dict[str, Any]:
+        props = self._get_json(client, f"{self._server_root()}/props")
+        runtime = runtime_from_props(props)
+        self._runtime = runtime
+        n_ctx = runtime.get("n_ctx")
+        if isinstance(n_ctx, int) and n_ctx > 0:
+            self._n_ctx = n_ctx
+        return runtime
+
+
+_SAMPLING_KEYS = (
+    "temperature",
+    "top_p",
+    "top_k",
+    "min_p",
+    "repeat_penalty",
+    "repeat_last_n",
+    "seed",
+)
+
+
+def runtime_from_props(props: dict[str, Any] | None) -> dict[str, Any]:
+    """Summarize llama-server /props: n_ctx, sampling params, template info."""
+    if not isinstance(props, dict):
+        return {}
+    settings = props.get("default_generation_settings")
+    settings = settings if isinstance(settings, dict) else {}
+    params = settings.get("params")
+    params = params if isinstance(params, dict) else settings
+    sampling = {k: params[k] for k in _SAMPLING_KEYS if k in params}
+    runtime: dict[str, Any] = {
+        "n_ctx": n_ctx_from_props(props),
+        "sampling": sampling,
+    }
+    template = props.get("chat_template")
+    if isinstance(template, str) and template:
+        runtime["chat_template_chars"] = len(template)
+        runtime["chat_template_has_tool_call"] = "tool_call" in template
+    for key in ("reasoning_format", "reasoning_budget", "enable_thinking"):
+        if key in params:
+            runtime.setdefault("reasoning", {})[key] = params[key]
+    caps = props.get("chat_template_caps")
+    if isinstance(caps, dict):
+        runtime["chat_template_caps"] = caps
+    return runtime
 
 
 def _request_ids() -> tuple[str | None, str | None]:
