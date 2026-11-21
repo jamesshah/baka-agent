@@ -26,7 +26,14 @@ class LLMClient(ABC):
         self,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
-        temperature: float = 0.7,
+        temperature: float | None = None,
         timeout: float | None = None,
+        top_p: float | None = None,
+        top_k: int | None = None,
+        repeat_penalty: float | None = None,
     ) -> dict[str, Any]:
-        """Return choices[0].message (may include content and/or tool_calls)."""
+        """Return choices[0].message (may include content and/or tool_calls).
+
+        Sampling arguments left as ``None`` are omitted from the request so the
+        server's own CLI flags / model defaults apply.
+        """

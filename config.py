@@ -1,5 +1,6 @@
 from functools import lru_cache
 
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -20,6 +21,33 @@ class Settings(BaseSettings):
 
     llama_base_url: str = "http://127.0.0.1:8080/v1"
     llama_model: str = "local"
+    # Client-side sampling overrides. None = omit from the request so the
+    # llama-server CLI flags / GGUF metadata defaults apply.
+    llama_temperature: float | None = Field(
+        default=None, validation_alias="LLAMA_CLIENT_TEMP"
+    )
+    llama_top_p: float | None = Field(
+        default=None, validation_alias="LLAMA_CLIENT_TOP_P"
+    )
+    llama_top_k: int | None = Field(
+        default=None, validation_alias="LLAMA_CLIENT_TOP_K"
+    )
+    llama_repeat_penalty: float | None = Field(
+        default=None, validation_alias="LLAMA_CLIENT_REPEAT_PENALTY"
+    )
+
+    @field_validator(
+        "llama_temperature",
+        "llama_top_p",
+        "llama_top_k",
+        "llama_repeat_penalty",
+        mode="before",
+    )
+    @classmethod
+    def _empty_to_none(cls, value: object) -> object:
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
 
     allowed_numbers: str = ""
 

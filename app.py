@@ -61,6 +61,10 @@ _settings = get_settings()
 _llm = LlamaServerAdapter(
     base_url=_settings.llama_base_url,
     model=_settings.llama_model,
+    temperature=_settings.llama_temperature,
+    top_p=_settings.llama_top_p,
+    top_k=_settings.llama_top_k,
+    repeat_penalty=_settings.llama_repeat_penalty,
 )
 _tools = ToolRegistry()
 _mcp: MultiServerMcpClient | None = None
