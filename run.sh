@@ -112,7 +112,7 @@ EMBEDDING_PORT="${EMBEDDING_PORT:-8081}"
 AGENT_HOST="${AGENT_HOST:-0.0.0.0}"
 AGENT_PORT="${AGENT_PORT:-8000}"
 MLFLOW_TRACKING_URI="${MLFLOW_TRACKING_URI:-sqlite:///${ROOT}/.data/mlflow.db}"
-MLFLOW_PORT="${MLFLOW_PORT:-5000}"
+MLFLOW_PORT="${MLFLOW_PORT:-5001}"
 LLAMA_HEALTH_URL="http://127.0.0.1:${LLAMA_PORT}/health"
 EMBEDDING_HEALTH_URL="http://127.0.0.1:${EMBEDDING_PORT}/health"
 AGENT_HEALTH_URL="http://127.0.0.1:${AGENT_PORT}/health"
@@ -438,7 +438,8 @@ cmd_mlflow() {
   exec "${mlflow_bin}" ui \
     --backend-store-uri "${uri}" \
     --host 127.0.0.1 \
-    --port "${MLFLOW_PORT}"
+    --port "${MLFLOW_PORT}" \
+    --workers 1
 }
 
 usage() {
