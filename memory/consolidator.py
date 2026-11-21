@@ -11,6 +11,8 @@ from typing import Any
 from llm.base import LLMClient
 from memory.embeddings import EmbeddingClient
 from memory.repository import SqlAlchemyMemoryRepository
+from tools.session_context import llm_call_context
+from tracing import trace_span
 
 logger = logging.getLogger(__name__)
 
@@ -69,15 +71,23 @@ class MemoryConsolidator:
             return
         source_id = self._repository.user_message_id(turn_id)
         try:
-            response = self._llm.chat(
-                [
-                    {"role": "system", "content": _EXTRACTION_PROMPT},
-                    {"role": "user", "content": user_text},
-                ],
-                temperature=0.0,
-                timeout=60.0,
-            )
-            candidates = _parse_candidates(response.get("content") or "")
+            with trace_span(
+                "memory_consolidator.extract",
+                span_type="CHAIN",
+                inputs={"user_text": user_text},
+                attributes={"turn_id": turn_id},
+            ) as span:
+                with llm_call_context("consolidator"):
+                    response = self._llm.chat(
+                        [
+                            {"role": "system", "content": _EXTRACTION_PROMPT},
+                            {"role": "user", "content": user_text},
+                        ],
+                        temperature=0.0,
+                        timeout=60.0,
+                    )
+                candidates = _parse_candidates(response.get("content") or "")
+                span.set_outputs({"candidates": candidates})
         except Exception:
             logger.exception("Memory extraction failed for turn %s", turn_id)
             return
@@ -121,23 +131,30 @@ class MemoryConsolidator:
             return
         conversation_id, start_sequence, end_sequence, transcript = batch
         try:
-            response = self._llm.chat(
-                [
-                    {
-                        "role": "system",
-                        "content": (
-                            "Summarize this conversation segment for future "
-                            "context. Preserve decisions, ongoing work, and "
-                            "important outcomes. Omit secrets and small talk. "
-                            "Return plain text under 800 words."
-                        ),
-                    },
-                    {"role": "user", "content": transcript},
-                ],
-                temperature=0.0,
-                timeout=90.0,
-            )
-            body = str(response.get("content") or "").strip()
+            with trace_span(
+                "memory_consolidator.summarize",
+                span_type="CHAIN",
+                inputs={"start_sequence": start_sequence, "end_sequence": end_sequence},
+            ) as span:
+                with llm_call_context("consolidator_summary"):
+                    response = self._llm.chat(
+                        [
+                            {
+                                "role": "system",
+                                "content": (
+                                    "Summarize this conversation segment for future "
+                                    "context. Preserve decisions, ongoing work, and "
+                                    "important outcomes. Omit secrets and small talk. "
+                                    "Return plain text under 800 words."
+                                ),
+                            },
+                            {"role": "user", "content": transcript},
+                        ],
+                        temperature=0.0,
+                        timeout=90.0,
+                    )
+                body = str(response.get("content") or "").strip()
+                span.set_outputs({"summary_chars": len(body)})
             if not body:
                 return
             summary = self._repository.put_summary(

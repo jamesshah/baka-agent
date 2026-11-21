@@ -58,6 +58,11 @@ class Settings(BaseSettings):
     # Durable local conversation and semantic memory.
     database_path: str = ".data/baka.db"
     memory_enabled: bool = True
+
+    # Local MLflow tracing (writes directly to SQLite; no background server needed).
+    mlflow_tracing_enabled: bool = True
+    mlflow_tracking_uri: str = "sqlite:///.data/mlflow.db"
+    mlflow_experiment: str = "baka-agent"
     memory_consolidation_enabled: bool = True
     memory_summary_every_turns: int = 20
     memory_max_chars: int = 3000

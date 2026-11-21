@@ -11,3 +11,4 @@ SQLAlchemy>=2.0.0
 alembic>=1.13.0
 sqlite-vec>=0.1.6
 PyYAML>=6.0
+mlflow>=3.0.0
