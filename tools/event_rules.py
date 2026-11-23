@@ -16,6 +16,11 @@ if TYPE_CHECKING:
 
 class ManageEventRulesTool(Tool):
     name = "manage_event_rules"
+    capability = "events"
+    capability_description = (
+        "Query stored connected-service events (e.g. Whoop sleep, recovery, workouts) "
+        "and list/create/enable/disable/delete event alert and digest rules."
+    )
     description = (
         "List, create, enable, disable, or delete the user's rules for "
         "connected-service events (e.g. Whoop). Use when the user says things "
@@ -84,7 +89,7 @@ class ManageEventRulesTool(Tool):
         self._connectors = connectors
 
     def is_chat_agent_tool(self) -> bool:
-        return True
+        return False
 
     def execute(self, **kwargs: Any) -> Any:
         phone = require_session_id()

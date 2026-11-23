@@ -12,4 +12,5 @@ mcp.json
 .run/
 .data/
 .cache/
+mlruns/
 *.gguf

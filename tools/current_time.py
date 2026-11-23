@@ -12,6 +12,8 @@ class GetCurrentTimeTool(Tool):
     """Return the current UTC time as an ISO-8601-ish string."""
 
     name = "get_current_time"
+    capability = "time"
+    capability_description = "Get the current date and time in UTC."
     description = "Get the current date and time in UTC."
     parameters: dict[str, Any] = {
         "type": "object",

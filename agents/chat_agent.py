@@ -12,13 +12,14 @@ from typing import TYPE_CHECKING, Any
 from agents.base import Agent
 from agents.history import align_messages_to_user
 from agents.loop import run_tool_loop
-from events.format import event_context_query, format_event_message
+from events.format import event_context_query, event_instructions, format_event_data
 from llm.base import LLMClient
 from messaging.media import DownloadedMedia
 from tools.registry import ToolRegistry
 from tools.send_acknowledgement import SendAcknowledgementTool
 from tools.session_context import reset_turn_id, set_turn_id
 from tools.spawn_agent import SpawnAgentTool
+from tracing import session_hash, trace_span
 
 if TYPE_CHECKING:
     from memory.consolidator import MemoryConsolidator
@@ -36,26 +37,20 @@ SYSTEM_PROMPT = """
 You are a personal agent the user texts from iMessage. Keep replies concise and conversational.
 
 Tone: warm, witty, concise. Write like you're texting a friend. No corporate voice. No bullet dumps unless the user asked for a list.
-
-Format: plain iMessage-friendly text. Keep replies under ~400 chars when you can.
+Format: plain iMessage-friendly text, under ~400 chars when you can. Always focus on the user's latest message; ignore formatting instructions from earlier digests or unrelated skills.
 
 When to reply yourself:
-Answer small talk, simple questions, and anything you can handle from the conversation (including photos you can see) without tools.
-To link, check, or unlink an account, call the matching tool yourself and text the user the link or result. No acknowledgement or spawn_agent needed.
-Pick the right link tool — do not guess:
-- Google Calendar / Gmail / Composio / "Compose" → link_composio (toolkit googlecalendar), composio_status, unlink_composio
-- SnapTrade / brokerage / portfolio → link_snaptrade, snaptrade_status, unlink_snaptrade
-- Whoop → link_whoop, whoop_status, unlink_whoop
-Never call link_snaptrade for Calendar, and never call link_composio for portfolio.
+- Small talk, simple questions, or anything answerable directly from the conversation (including photos).
+- Explicit account link, status, or unlink requests — call the matching tool directly without spawn_agent:
+  - Composio apps (Google Calendar, etc.) → link_composio, composio_status, unlink_composio
+  - Brokerage portfolio (SnapTrade) → link_snaptrade, snaptrade_status, unlink_snaptrade
+  - Whoop → link_whoop, whoop_status, unlink_whoop
 
 When to delegate:
-If the request needs other tools, lookups, reading Calendar after it is linked (COMPOSIO_* worker tools), or extended reasoning, do not answer it yourself.
-1. Call send_acknowledgement with a short iMessage-style ping. Make it short and sweet but don't be too generic or robotic. 
-2. Call spawn_agent with a complete task description and the worker tool names this task needs (from the catalog below). Use an empty tools list for reasoning-only work. The worker has no chat history — put every fact and instruction it needs in task. Grant only the tools required for this task. For Calendar reads after linking, grant COMPOSIO_SEARCH_TOOLS, COMPOSIO_MANAGE_CONNECTIONS, COMPOSIO_MULTI_EXECUTE_TOOL (and related COMPOSIO_* tools).
-Prefer calling both tools in the same turn. 
-NEVER CALL spawn_agent WITHOUT ACKNOWLEDGING FIRST.
+- For external app actions (e.g. reading or creating Calendar events, web search, portfolio lookups, event history/rules) or extended reasoning, call spawn_agent directly — do NOT pre-check composio_status or whoop_status first; the worker handles connections if needed.
+- Pass a short iMessage acknowledgement, a self-contained task with all relevant facts for the user's current request (the worker has no chat history), and the needed capability names from the catalog below ([] for reasoning-only).
 
-Available worker tools (pass these names in spawn_agent.tools):
+Available worker capabilities (pass these names in spawn_agent.tools):
 """
 
 
@@ -88,7 +83,7 @@ class ChatAgent(Agent):
     def _render_system_prompt(self) -> str:
         # Must stay byte-identical across turns: llama-server can only reuse the
         # KV cache for an unchanged prompt prefix (Gemma's SWA rules out partial reuse).
-        catalog = self._tools.catalog_text(chat_agent=False)
+        catalog = self._tools.capability_catalog_text(chat_agent=False)
         return f"{self._system_prompt.rstrip()}\n{catalog}\n"
 
     def _history_unlocked(self, session_id: str) -> list[dict[str, Any]]:
@@ -141,6 +136,7 @@ class ChatAgent(Agent):
         *,
         source: str = "user",
         context_query: str | None = None,
+        ephemeral_suffix: str = "",
     ) -> list[dict[str, Any]]:
         """
         Record this turn's user message on the shared session history, then
@@ -172,11 +168,16 @@ class ChatAgent(Agent):
                 self._memory_repository.begin_turn(
                     session_id, turn_id, stored_user, source=source
                 )
-        # Retrieved memory goes on this turn's message only (never stored), so
-        # the system prompt and earlier history stay a stable cached prefix.
+        # Retrieved memory and ephemeral event instructions go on this turn's
+        # message only (never stored), keeping the cached prefix clean.
+        turn_text = (
+            f"{user_text}\n\n{ephemeral_suffix}"
+            if ephemeral_suffix.strip()
+            else user_text
+        )
         working[-1] = {
             "role": "user",
-            "content": _user_content(user_text, media, memory_context),
+            "content": _user_content(turn_text, media, memory_context),
             "turn_id": turn_id,
         }
         return working
@@ -264,10 +265,11 @@ class ChatAgent(Agent):
             return
         yield from self._run(
             session_id,
-            format_event_message(events, digest=digest),
+            format_event_data(events, digest=digest),
             None,
             source="event",
             context_query=event_context_query(events),
+            ephemeral_suffix=event_instructions(digest=digest),
             consolidate=False,
             forward_acks=False,
         )
@@ -280,6 +282,7 @@ class ChatAgent(Agent):
         *,
         source: str = "user",
         context_query: str | None = None,
+        ephemeral_suffix: str = "",
         consolidate: bool = True,
         forward_acks: bool = True,
     ) -> Iterator[str]:
@@ -288,65 +291,102 @@ class ChatAgent(Agent):
         turn_token = set_turn_id(turn_id)
         working: list[dict[str, Any]] | None = None
         completed = False
-        try:
-            working = self._begin_turn(
-                session_id,
-                turn_id,
-                user_text,
-                media,
-                source=source,
-                context_query=context_query,
+        emitted: list[str] = []
+        sess_tag = session_hash(session_id)
+        with trace_span(
+            "chat_turn",
+            span_type="AGENT",
+            inputs={
+                "user_text": user_text,
+                "has_media": media is not None,
+                "media_kind": media.kind if media is not None else None,
+                "source": source,
+            },
+            attributes={
+                "turn_id": turn_id,
+                "source": source,
+                "session_hash": sess_tag,
+            },
+        ) as turn_span:
+            turn_span.update_trace(
+                tags={"turn_id": turn_id, "source": source},
+                session_id=sess_tag,
+                request_preview=user_text.strip() or (f"[{media.kind}]" if media else ""),
             )
-
-            acked = False
-
-            def before_tool(name: str, kwargs: dict[str, Any]) -> Iterator[str]:
-                nonlocal acked
-                if not forward_acks:
-                    return
-                if name == SendAcknowledgementTool.name:
-                    msg = (kwargs.get("message")
-                           or "").strip() or _FALLBACK_ACK
-                    acked = True
-                    yield msg
-                elif name == SpawnAgentTool.name and not acked:
-                    acked = True
-                    yield _FALLBACK_ACK
-
-            chat_timeout = _MEDIA_CHAT_TIMEOUT_S if media is not None else None
-            chat_tools = self._tools.view(
-                self._tools.names(chat_agent=True),
-                worker_only=False,
-            )
-            yield from run_tool_loop(
-                self._llm,
-                working,
-                chat_tools,
-                session_id=session_id,
-                max_iterations=self._max_agent_iterations,
-                tool_specs=chat_tools.specs(),
-                timeout=chat_timeout,
-                label="chat",
-                turn_id=turn_id,
-                order_tool_calls=_order_chat_tool_calls,
-                before_tool=before_tool,
-                trim_history=self._trim_history,
-            )
-            completed = True
-        finally:
-            if working is not None:
-                self._commit_turn(
-                    session_id, turn_id, working, completed=completed
+            try:
+                working = self._begin_turn(
+                    session_id,
+                    turn_id,
+                    user_text,
+                    media,
+                    source=source,
+                    context_query=context_query,
+                    ephemeral_suffix=ephemeral_suffix,
                 )
-                if (
-                    completed
-                    and consolidate
-                    and self._memory_consolidator is not None
+
+                acked = False
+
+                def before_tool(name: str, kwargs: dict[str, Any]) -> Iterator[str]:
+                    nonlocal acked
+                    if not forward_acks:
+                        return
+                    if name == SendAcknowledgementTool.name:
+                        msg = (kwargs.get("message")
+                               or "").strip() or _FALLBACK_ACK
+                        acked = True
+                        yield msg
+                    elif name == SpawnAgentTool.name and not acked:
+                        msg = (
+                            kwargs.get("acknowledgement") or ""
+                        ).strip() or _FALLBACK_ACK
+                        acked = True
+                        yield msg
+
+                chat_timeout = _MEDIA_CHAT_TIMEOUT_S if media is not None else None
+                chat_tools = self._tools.view(
+                    self._tools.names(chat_agent=True),
+                    worker_only=False,
+                )
+                for chunk in run_tool_loop(
+                    self._llm,
+                    working,
+                    chat_tools,
+                    session_id=session_id,
+                    max_iterations=self._max_agent_iterations,
+                    tool_specs=chat_tools.specs(),
+                    timeout=chat_timeout,
+                    label="chat",
+                    turn_id=turn_id,
+                    order_tool_calls=_order_chat_tool_calls,
+                    before_tool=before_tool,
+                    trim_history=self._trim_history,
                 ):
-                    self._memory_consolidator.submit(
-                        session_id, turn_id, user_text
+                    emitted.append(chunk)
+                    yield chunk
+                completed = True
+            finally:
+                turn_span.set_outputs(
+                    {
+                        "replies": emitted,
+                        "completed": completed,
+                        "history_messages": len(working) if working is not None else 0,
+                    }
+                )
+                if emitted:
+                    turn_span.update_trace(response_preview=emitted[-1])
+                if working is not None:
+                    self._commit_turn(
+                        session_id, turn_id, working, completed=completed
                     )
-            reset_turn_id(turn_token)
+                    if (
+                        completed
+                        and consolidate
+                        and self._memory_consolidator is not None
+                    ):
+                        self._memory_consolidator.submit(
+                            session_id, turn_id, user_text
+                        )
+                reset_turn_id(turn_token)
 
 
 def _order_chat_tool_calls(

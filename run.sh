@@ -8,6 +8,8 @@
 #   ./run.sh status
 #   ./run.sh logs [llama|agent]
 #   ./run.sh migrate [current|history]
+#   ./run.sh eval [eval_models.py flags...]
+#   ./run.sh mlflow [--no-open]
 #
 # Optional env overrides (shell env wins over .env; only these keys are read from .env):
 #   LLAMA_HF_REPO    Hugging Face model for llama-server -hf (default below)
@@ -30,9 +32,11 @@ LOG_DIR="${RUN_DIR}/logs"
 LLAMA_PID_FILE="${RUN_DIR}/llama-server.pid"
 EMBED_PID_FILE="${RUN_DIR}/embedding-server.pid"
 AGENT_PID_FILE="${RUN_DIR}/agent.pid"
+MLFLOW_PID_FILE="${RUN_DIR}/mlflow.pid"
 LLAMA_LOG="${LOG_DIR}/llama-server.log"
 EMBED_LOG="${LOG_DIR}/embedding-server.log"
 AGENT_LOG="${LOG_DIR}/agent.log"
+MLFLOW_LOG="${LOG_DIR}/mlflow.log"
 
 # Load one KEY from .env if unset. Does not `source` the file (avoids bash
 # breaking on spaces/special chars in other values like secrets).
@@ -83,6 +87,8 @@ dotenv_get EMBEDDING_CACHE
 dotenv_get EMBEDDING_PORT
 dotenv_get AGENT_HOST
 dotenv_get AGENT_PORT
+dotenv_get MLFLOW_TRACKING_URI
+dotenv_get MLFLOW_PORT
 
 # Defaults when neither shell env nor .env set the value.
 LLAMA_HF_REPO="${LLAMA_HF_REPO:-unsloth/gemma-4-12b-it-GGUF:UD-Q4_K_XL}"
@@ -109,6 +115,8 @@ EMBEDDING_CACHE="${EMBEDDING_CACHE:-${EMBEDDING_HF_REPO%%:*}}"
 EMBEDDING_PORT="${EMBEDDING_PORT:-8081}"
 AGENT_HOST="${AGENT_HOST:-0.0.0.0}"
 AGENT_PORT="${AGENT_PORT:-8000}"
+MLFLOW_TRACKING_URI="${MLFLOW_TRACKING_URI:-sqlite:///${ROOT}/.data/mlflow.db}"
+MLFLOW_PORT="${MLFLOW_PORT:-5001}"
 LLAMA_HEALTH_URL="http://127.0.0.1:${LLAMA_PORT}/health"
 EMBEDDING_HEALTH_URL="http://127.0.0.1:${EMBEDDING_PORT}/health"
 AGENT_HEALTH_URL="http://127.0.0.1:${AGENT_PORT}/health"
@@ -418,6 +426,151 @@ cmd_logs() {
   esac
 }
 
+resolve_mlflow_uri() {
+  local uri="${MLFLOW_TRACKING_URI}"
+  if [[ "${uri}" == sqlite:///* && "${uri}" != sqlite:////* && "${uri}" != "sqlite:///:memory:" ]]; then
+    local rel="${uri#sqlite:///}"
+    uri="sqlite:///${ROOT}/${rel}"
+  fi
+  printf '%s' "${uri}"
+}
+
+start_mlflow_bg() {
+  local open_browser="${1:-1}"
+  local mlflow_bin="${ROOT}/.venv/bin/mlflow"
+  if [[ ! -x "${mlflow_bin}" ]]; then
+    echo "Missing ${mlflow_bin}. Install dependencies first: .venv/bin/pip install -r requirements.txt" >&2
+    exit 1
+  fi
+  local uri
+  uri="$(resolve_mlflow_uri)"
+  local ui_url="http://127.0.0.1:${MLFLOW_PORT}"
+  mkdir -p "${ROOT}/.data"
+
+  if curl -sf "${ui_url}" >/dev/null 2>&1; then
+    echo "MLflow UI already running at ${ui_url}"
+  else
+    echo "Starting MLflow UI (${uri}) in background on ${ui_url} (log: ${MLFLOW_LOG})…"
+    nohup "${mlflow_bin}" ui \
+      --backend-store-uri "${uri}" \
+      --host 127.0.0.1 \
+      --port "${MLFLOW_PORT}" \
+      --workers 1 \
+      >>"${MLFLOW_LOG}" 2>&1 &
+    echo $! >"${MLFLOW_PID_FILE}"
+    wait_for_url "${ui_url}" "MLflow UI" 30
+  fi
+
+  if [[ "${open_browser}" -eq 1 ]] && command -v open >/dev/null 2>&1; then
+    open "${ui_url}"
+  fi
+}
+
+cmd_mlflow() {
+  local open_browser=1
+  if [[ "${1:-}" == "--no-open" ]]; then
+    open_browser=0
+  fi
+  local mlflow_bin="${ROOT}/.venv/bin/mlflow"
+  if [[ ! -x "${mlflow_bin}" ]]; then
+    echo "Missing ${mlflow_bin}. Install dependencies first: .venv/bin/pip install -r requirements.txt" >&2
+    exit 1
+  fi
+  local uri
+  uri="$(resolve_mlflow_uri)"
+  local ui_url="http://127.0.0.1:${MLFLOW_PORT}"
+  mkdir -p "${ROOT}/.data"
+  if curl -sf "${ui_url}" >/dev/null 2>&1; then
+    echo "MLflow UI is already running at ${ui_url}"
+    if [[ "${open_browser}" -eq 1 ]] && command -v open >/dev/null 2>&1; then
+      open "${ui_url}"
+    fi
+    return 0
+  fi
+  echo "Starting MLflow UI (${uri}) on ${ui_url} (Ctrl-C to stop)…"
+  if [[ "${open_browser}" -eq 1 ]] && command -v open >/dev/null 2>&1; then
+    (
+      wait_for_url "${ui_url}" "MLflow UI" 30 >/dev/null 2>&1 && open "${ui_url}"
+    ) &
+  fi
+  exec "${mlflow_bin}" ui \
+    --backend-store-uri "${uri}" \
+    --host 127.0.0.1 \
+    --port "${MLFLOW_PORT}" \
+    --workers 1
+}
+
+cmd_eval() {
+  local python_bin="${ROOT}/.venv/bin/python"
+  if [[ ! -x "${python_bin}" ]]; then
+    echo "Missing ${python_bin}; create the venv and install dependencies first." >&2
+    exit 1
+  fi
+
+  local open_ui=0
+  local info_only=0
+  local has_base_url=0
+  local has_mlflow_uri=0
+  local forward_args=()
+  local arg
+  for arg in "$@"; do
+    case "${arg}" in
+      --ui|--open-mlflow)
+        open_ui=1
+        ;;
+      --list-cases|-h|--help)
+        info_only=1
+        forward_args+=("${arg}")
+        ;;
+      --base-url|--base-url=*)
+        has_base_url=1
+        forward_args+=("${arg}")
+        ;;
+      --mlflow-uri|--mlflow-uri=*)
+        has_mlflow_uri=1
+        forward_args+=("${arg}")
+        ;;
+      *)
+        forward_args+=("${arg}")
+        ;;
+    esac
+  done
+
+  if [[ "${info_only}" -eq 0 && "${has_base_url}" -eq 0 ]]; then
+    if ! curl -sf "${LLAMA_HEALTH_URL}" >/dev/null 2>&1; then
+      start_llama
+    fi
+  fi
+
+  local uri
+  uri="$(resolve_mlflow_uri)"
+  mkdir -p "${ROOT}/.data"
+
+  # Start and open MLflow UI *before* the eval starts so progress and per-case
+  # traces/runs can be watched live while the suite runs.
+  if [[ "${open_ui}" -eq 1 && "${info_only}" -eq 0 ]]; then
+    start_mlflow_bg 1
+  fi
+
+  local extra_flags=()
+  if [[ "${has_base_url}" -eq 0 ]]; then
+    extra_flags+=(--base-url "http://127.0.0.1:${LLAMA_PORT}/v1")
+  fi
+  if [[ "${info_only}" -eq 0 ]]; then
+    extra_flags+=(--mlflow)
+    if [[ "${has_mlflow_uri}" -eq 0 ]]; then
+      extra_flags+=(--mlflow-uri "${uri}")
+    fi
+  fi
+
+  (
+    cd "${ROOT}"
+    PYTHONPATH="${ROOT}" "${python_bin}" "${ROOT}/scripts/eval_models.py" \
+      "${extra_flags[@]}" \
+      "${forward_args[@]+"${forward_args[@]}"}"
+  )
+}
+
 usage() {
   cat <<'EOF'
 Run llama-server + baka-agent in the background (macOS).
@@ -429,11 +582,16 @@ Usage:
   ./run.sh status
   ./run.sh logs [llama|embedding|agent]
   ./run.sh migrate [upgrade|current|history]
+  ./run.sh eval [eval_models.py flags...] [--ui] # run model eval harness (logs to MLflow)
+  ./run.sh mlflow [--no-open]                    # start & open local MLflow UI
 
 Examples:
   ./run.sh restart agent    # only re-run the agent
   ./run.sh restart llama    # only re-run llama-server
   ./run.sh start            # start both
+  ./run.sh eval             # run all eval cases against llama-server & log to MLflow
+  ./run.sh eval --ui        # run evals, then launch & open the MLflow UI
+  ./run.sh mlflow           # launch & open the MLflow UI in your browser
 
 Optional env overrides (shell env wins; else .env; else defaults):
   LLAMA_HF_REPO     Hugging Face model for llama-server -hf
@@ -464,6 +622,9 @@ main() {
     restart) shift || true; cmd_restart "${1:-all}" ;;
     status) cmd_status ;;
     logs) shift || true; cmd_logs "${1:-both}" ;;
+    eval|evals) shift || true; cmd_eval "$@" ;;
+    eval-ui) shift || true; cmd_eval --ui "$@" ;;
+    mlflow) shift || true; cmd_mlflow "$@" ;;
     migrate)
       shift || true
       case "${1:-upgrade}" in

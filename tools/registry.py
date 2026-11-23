@@ -67,6 +67,86 @@ class ToolRegistry:
             lines.append(f"- {tool.name}: {description}")
         return "\n".join(lines)
 
+    def capability_names(self, *, chat_agent: bool | None = None) -> list[str]:
+        """Sorted capability group names exposed for delegation."""
+        return sorted(
+            {tool.capability_group() for tool in self._iter_tools(chat_agent=chat_agent)}
+        )
+
+    def capability_catalog_text(self, *, chat_agent: bool | None = None) -> str:
+        """Compact capability-level catalog for ChatAgent (one line per capability group)."""
+        tools = sorted(
+            self._iter_tools(chat_agent=chat_agent),
+            key=lambda tool: tool.name,
+        )
+        if not tools:
+            return "- (none registered)"
+        grouped: dict[str, list[Tool]] = {}
+        for tool in tools:
+            grouped.setdefault(tool.capability_group(), []).append(tool)
+        lines: list[str] = []
+        for group in sorted(grouped):
+            members = grouped[group]
+            custom_desc = next(
+                (
+                    " ".join(t.capability_description.split())
+                    for t in members
+                    if t.capability_description and t.capability_description.strip()
+                ),
+                None,
+            )
+            if custom_desc:
+                description = custom_desc
+            elif len(members) == 1:
+                description = " ".join((members[0].description or "").split())
+            else:
+                preview = ", ".join(t.name for t in members[:4])
+                suffix = f" (+{len(members) - 4} more)" if len(members) > 4 else ""
+                description = f"{len(members)} tools: {preview}{suffix}"
+            if len(description) > 180:
+                description = description[:177] + "..."
+            lines.append(f"- {group}: {description}")
+        return "\n".join(lines)
+
+    def resolve_worker_tools(self, requested: list[str]) -> list[str]:
+        """Expand capability group names and/or explicit worker tool names into tool names."""
+        worker_tools = sorted(
+            self._iter_tools(chat_agent=False),
+            key=lambda tool: tool.name,
+        )
+        by_name = {tool.name: tool for tool in worker_tools}
+        by_group: dict[str, list[str]] = {}
+        for tool in worker_tools:
+            by_group.setdefault(tool.capability_group(), []).append(tool.name)
+
+        resolved: list[str] = []
+        seen: set[str] = set()
+        for item in requested:
+            token = (item or "").strip()
+            if not token:
+                continue
+            if token in by_name:
+                if token not in seen:
+                    seen.add(token)
+                    resolved.append(token)
+                continue
+            if token in by_group:
+                for member in by_group[token]:
+                    if member not in seen:
+                        seen.add(member)
+                        resolved.append(member)
+                continue
+            # Also tolerate case-insensitive capability group matches.
+            lowered = token.lower()
+            for group_name, members in by_group.items():
+                if group_name.lower() == lowered:
+                    for member in members:
+                        if member not in seen:
+                            seen.add(member)
+                            resolved.append(member)
+                    break
+        return resolved
+
     def view(
         self,
         names: list[str],

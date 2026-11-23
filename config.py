@@ -58,6 +58,11 @@ class Settings(BaseSettings):
     # Durable local conversation and semantic memory.
     database_path: str = ".data/baka.db"
     memory_enabled: bool = True
+
+    # Local MLflow tracing (writes directly to SQLite; no background server needed).
+    mlflow_tracing_enabled: bool = True
+    mlflow_tracking_uri: str = "sqlite:///.data/mlflow.db"
+    mlflow_experiment: str = "baka-agent"
     memory_consolidation_enabled: bool = True
     memory_summary_every_turns: int = 20
     memory_max_chars: int = 3000
@@ -73,6 +78,7 @@ class Settings(BaseSettings):
     memory_lexical_weight: float = 0.45
     memory_vector_weight: float = 0.55
     memory_minimum_vector_score: float = 0.3
+    memory_minimum_skill_score: float = 0.35
 
     # Cursor-compatible MCP config (mcpServers in a JSON file).
     mcp_config_path: str = "mcp.json"
@@ -85,6 +91,10 @@ class Settings(BaseSettings):
     composio_api_key: str = ""
     # Comma-separated toolkit slugs the session may discover/use.
     composio_toolkits: str = "googlecalendar"
+    # Disable remote cloud sandbox (WORKBENCH/BASH) by default to keep prompts lean.
+    composio_sandbox_enabled: bool = False
+    # Compact verbose Composio meta-tool & runtime tool schemas for smaller local LLMs.
+    composio_compact_schemas: bool = True
 
     # Public origin of this server (tunnel host), e.g. https://xxxx.trycloudflare.com.
     # Connector webhooks arrive at <public_base_url>/webhooks/connectors/<name>.

@@ -9,19 +9,19 @@ from agents.loop import run_tool_loop
 from llm.base import LLMClient
 from tools.registry import ToolRegistry
 from tools.session_context import get_turn_id
+from tracing import trace_span
 
 logger = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = """
-You are a worker agent. You only have the tools provided in this request — do not assume others exist. Complete the assigned task using those tools if needed. Return a concise factual result for the chat agent to relay to the user. Do not greet the user, do not add chit-chat, and do not mention that you are a worker.
+You are a worker agent. Use ONLY the tools provided in this request — do not assume others exist. Return a concise, factual result for the chat agent to relay. No greetings, chit-chat, or mentioning that you are a worker.
 
-You are only allowed to use the tools provided in this request - do not assume others exist. If you cannot perform the task with the tools provided, return "I cannot perform this task with the tools provided."
+Never claim an action succeeded or an item was created/found unless a tool call in this turn actually returned that result. If a tool fails or is missing, report the exact error plainly.
 
-SnapTrade portfolio tools are read-only and require a one-time link:
-if the task is about balances/positions/orders and SnapTrade is not linked, call link_snaptrade and include the verification URL in your result.
-Brokerage connection links from SnapTrade expire in about 5 minutes.
-
-Composio Tool Router (COMPOSIO_SEARCH_TOOLS, COMPOSIO_MANAGE_CONNECTIONS, COMPOSIO_MULTI_EXECUTE_TOOL, etc.) reaches apps like Google Calendar. If a toolkit is not connected, call COMPOSIO_MANAGE_CONNECTIONS (when granted) and include the Connect Link URL in your result so the user can approve in a browser. Do not use SnapTrade tools for Calendar.
+When using Composio tools:
+1. Call COMPOSIO_SEARCH_TOOLS first to discover exact tool slugs, input schemas, and connection status.
+2. If a toolkit is not connected, call COMPOSIO_MANAGE_CONNECTIONS (when granted) and include the Connect Link URL in your result.
+3. Call COMPOSIO_MULTI_EXECUTE_TOOL with the discovered tool_slug and schema-compliant arguments.
 """
 
 
@@ -45,6 +45,10 @@ class ExecutorAgent:
         """Worker tools that ChatAgent may grant on spawn."""
         return self._tools.names(chat_agent=False)
 
+    def available_capabilities(self) -> list[str]:
+        """Capability group names exposed to ChatAgent for spawn_agent.tools."""
+        return self._tools.capability_names(chat_agent=False)
+
     def run_task(
         self,
         session_id: str,
@@ -54,8 +58,15 @@ class ExecutorAgent:
     ) -> str:
         """Run one delegated task with only the granted worker tools."""
         requested = tool_names or []
-        granted = self._tools.view(requested, worker_only=True)
-        skipped = [name for name in requested if name not in granted.names()]
+        resolved_names = self._tools.resolve_worker_tools(requested)
+        granted = self._tools.view(resolved_names, worker_only=True)
+        valid_groups = {g.lower() for g in self._tools.capability_names(chat_agent=False)}
+        valid_names = set(self._tools.names(chat_agent=False))
+        skipped = [
+            name
+            for name in requested
+            if name not in valid_names and name.lower() not in valid_groups
+        ]
         turn_id = get_turn_id()
         logger.info(
             "executor start session=%s turn=%s granted=%s skipped=%s",
@@ -69,15 +80,35 @@ class ExecutorAgent:
             {"role": "user", "content": task},
         ]
         result = ""
-        for text in run_tool_loop(
-            self._llm,
-            history,
-            granted,
-            session_id=session_id,
-            max_iterations=self._max_agent_iterations,
-            tool_specs=granted.specs(),
-            label="executor",
-            turn_id=turn_id,
-        ):
-            result = text
+        with trace_span(
+            "executor_task",
+            span_type="AGENT",
+            inputs={
+                "task": task,
+                "requested_tools": requested,
+            },
+            attributes={
+                "turn_id": turn_id,
+                "granted_tools": granted.names(),
+                "skipped_tools": skipped,
+                "max_iterations": self._max_agent_iterations,
+            },
+        ) as span:
+            for text in run_tool_loop(
+                self._llm,
+                history,
+                granted,
+                session_id=session_id,
+                max_iterations=self._max_agent_iterations,
+                tool_specs=granted.specs(),
+                label="executor",
+                turn_id=turn_id,
+            ):
+                result = text
+            span.set_outputs(
+                {
+                    "result": result,
+                    "message_count": len(history),
+                }
+            )
         return result

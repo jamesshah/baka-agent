@@ -23,6 +23,7 @@ from events.rules import RuleEngine
 from events.triage import EventTriage, parse_quiet_hours
 from llm import LlamaServerAdapter
 from log_redact import configure_logging
+from tracing import configure_tracing, flush_traces, tracing_health
 from mcp_client import MultiServerMcpClient, load_mcp_config
 from mcp_client.token_store import FileTokenStore
 from memory import (
@@ -42,7 +43,6 @@ from tools import (
     LinkComposioTool,
     LinkSnaptradeTool,
     ManageMemoryTool,
-    SendAcknowledgementTool,
     SnaptradeStatusTool,
     SpawnAgentTool,
     ToolRegistry,
@@ -93,6 +93,7 @@ _retriever = (
         lexical_weight=_settings.memory_lexical_weight,
         vector_weight=_settings.memory_vector_weight,
         minimum_vector_score=_settings.memory_minimum_vector_score,
+        minimum_skill_score=_settings.memory_minimum_skill_score,
     )
     if _memory_repository is not None
     else None
@@ -135,8 +136,7 @@ _executor = ExecutorAgent(
 )
 
 _tools.register(GetCurrentTimeTool())
-_tools.register(SendAcknowledgementTool())
-_tools.register(SpawnAgentTool(_executor, _context_builder))
+_tools.register(SpawnAgentTool(_executor))
 if _memory_repository is not None:
     _tools.register(ManageMemoryTool(_memory_repository, _embeddings))
 
@@ -328,6 +328,8 @@ def _start_composio() -> ComposioHub | None:
     hub = ComposioHub(
         api_key=_settings.composio_api_key,
         toolkits=_settings.composio_toolkit_list,
+        sandbox_enabled=_settings.composio_sandbox_enabled,
+        compact_schemas=_settings.composio_compact_schemas,
     )
     hub.start()
     _register_composio_tools(hub)
@@ -373,6 +375,11 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     global _mcp, _composio
     # Uvicorn installs its own handlers before import; wrap any added since.
     configure_logging()
+    configure_tracing(
+        enabled=_settings.mlflow_tracing_enabled,
+        tracking_uri=_settings.mlflow_tracking_uri,
+        experiment=_settings.mlflow_experiment,
+    )
     if _settings.memory_enabled:
         upgrade_database(_settings.database_path)
         indexed = _skill_indexer.sync() if _skill_indexer is not None else 0
@@ -431,6 +438,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         _memory_consolidator.close()
     if _database is not None:
         _database.close()
+    flush_traces()
 
 
 app = FastAPI(title="baka-agent", version="0.1.0", lifespan=lifespan)
@@ -533,6 +541,7 @@ def health() -> JSONResponse:
         "mcp": mcp_check,
         "composio": _composio_health(),
         "model": model_check,
+        "tracing": tracing_health(),
         "sendblue_webhook": webhook_check,
         "connectors": _connectors_health(),
     }

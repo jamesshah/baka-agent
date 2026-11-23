@@ -18,36 +18,43 @@ logger = logging.getLogger(__name__)
 
 
 class SpawnAgentTool(Tool):
-    """ChatAgent-only: run a worker agent with a chosen subset of tools."""
+    """ChatAgent-only: run a worker agent with a chosen subset of capabilities/tools."""
 
     name = "spawn_agent"
     description = (
-        "Delegate a task that needs tools, lookups, or extended reasoning "
-        "to a worker agent. Include all conversation context the worker needs "
-        "in task. Pass tools as the worker tool names from the catalog that "
-        "this task actually needs (empty list for reasoning-only). "
-        "Call send_acknowledgement first."
+        "Delegate a task that needs external apps, lookups, or extended reasoning "
+        "to a worker agent. Include a short iMessage acknowledgement to send "
+        "immediately, a self-contained task description with all needed facts, "
+        "and the capability names from the catalog (empty list for reasoning-only)."
     )
     parameters: dict[str, Any] = {
         "type": "object",
         "properties": {
+            "acknowledgement": {
+                "type": "string",
+                "description": (
+                    "Short, natural one-line iMessage ping texted immediately "
+                    "before the worker starts, e.g. 'Checking your calendar…'"
+                ),
+            },
             "task": {
                 "type": "string",
                 "description": (
-                    "Full instructions for the worker, including any context "
-                    "from the conversation."
+                    "Complete instructions for the worker focused strictly on "
+                    "the user's current request, including relevant facts from "
+                    "the conversation."
                 ),
             },
             "tools": {
                 "type": "array",
                 "items": {"type": "string"},
                 "description": (
-                    "Worker tool names to grant this executor. Only names from "
-                    "the available-tools catalog. Use [] if no tools are needed."
+                    "Capability names (from the catalog) this task needs. "
+                    "Use [] if no tools are needed."
                 ),
             },
         },
-        "required": ["task", "tools"],
+        "required": ["acknowledgement", "task", "tools"],
         "additionalProperties": False,
     }
 
@@ -57,6 +64,9 @@ class SpawnAgentTool(Tool):
         context_builder: ContextBuilder | None = None,
     ) -> None:
         self._executor = executor
+        # Kept for signature compatibility; ChatAgent already receives <context>
+        # and passes relevant facts in ``task`` so ExecutorAgent stays focused
+        # and preserves KV-cache reuse without duplicate skill/event injection.
         self._context_builder = context_builder
 
     def is_chat_agent_tool(self) -> bool:
@@ -64,11 +74,11 @@ class SpawnAgentTool(Tool):
 
     def to_openai_spec(self) -> dict[str, Any]:
         spec = copy.deepcopy(super().to_openai_spec())
-        worker_names = self._executor.available_tool_names()
-        if worker_names:
+        capabilities = self._executor.available_capabilities()
+        if capabilities:
             spec["function"]["parameters"]["properties"]["tools"]["items"] = {
                 "type": "string",
-                "enum": worker_names,
+                "enum": capabilities,
             }
         return spec
 
@@ -78,10 +88,6 @@ class SpawnAgentTool(Tool):
             return "spawn_agent error: task is required"
         requested = _as_name_list(kwargs.get("tools"))
         session_id = require_session_id()
-        if self._context_builder is not None:
-            context = self._context_builder.render(session_id, task)
-            if context:
-                task = f"{task}\n\n{context}"
         logger.info(
             "spawning executor session=%s turn=%s requested_tools=%s",
             session_id,
