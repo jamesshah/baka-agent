@@ -21,6 +21,11 @@ _MAX_EVENTS = 100
 
 class QueryEventsTool(Tool):
     name = "query_events"
+    capability = "events"
+    capability_description = (
+        "Query stored connected-service events (e.g. Whoop sleep, recovery, workouts) "
+        "and manage event alert/digest rules."
+    )
     description = (
         "Look up the user's stored events from connected services (e.g. Whoop "
         "sleep, recovery, workouts). Use for questions like 'how did I sleep "

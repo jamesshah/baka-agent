@@ -29,7 +29,7 @@ from evals.scorers import ScoreBreakdown, score_case, surface_valid_worker_tools
 from llm.base import LLMClient
 from tools.registry import ToolRegistry
 from tools.session_context import reset_session_id, set_session_id
-from tools.spawn_agent import SpawnAgentTool
+from tools.spawn_agent import SpawnAgentTool, _as_name_list
 
 
 class RecordingSpawnAgentTool(SpawnAgentTool):
@@ -45,8 +45,11 @@ class RecordingSpawnAgentTool(SpawnAgentTool):
         self._world = world
 
     def execute(self, **kwargs: Any) -> str:
+        requested = _as_name_list(kwargs.get("tools"))
+        resolved = self._executor._tools.resolve_worker_tools(requested)
         result = super().execute(**kwargs)
         self._world.record_call("chat", self.name, kwargs, result)
+        self._world.tool_calls[-1]["granted_tools"] = resolved
         return result
 
 
@@ -161,6 +164,7 @@ def run_case(
 
     valid_chat_tools = set(registry.names(chat_agent=True))
     valid_worker_tools = surface_valid_worker_tools(effective_surface)
+    valid_capabilities = set(registry.capability_names(chat_agent=False))
 
     started = time.perf_counter()
     replies: list[str] = []
@@ -251,6 +255,7 @@ def run_case(
             effective_surface=effective_surface,
             valid_chat_tools=valid_chat_tools,
             valid_worker_tools=valid_worker_tools,
+            valid_capabilities=valid_capabilities,
         )
 
         if case_span is not None:

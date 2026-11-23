@@ -303,6 +303,7 @@ class EventTurnTests(EventPipelineCase):
         history = self.repository.load_history(PHONE, limit=10)
         self.assertEqual("user", history[0]["role"])
         self.assertIn("Recovery 22%", history[0]["content"])
+        self.assertNotIn("Write one short", history[0]["content"])
         self.assertEqual("event", self.repository.turn_source(history[0]["turn_id"]))
 
         list(agent.run_turn(PHONE, "why?"))

@@ -181,3 +181,48 @@ class ConnectorToolScopeTests(unittest.TestCase):
         )
         for cls in (LinkSnaptradeTool, SnaptradeStatusTool, UnlinkSnaptradeTool):
             self.assertTrue(cls(client=None).is_chat_agent_tool())  # type: ignore[arg-type]
+
+
+class CapabilityGroupTests(unittest.TestCase):
+    def test_capability_catalog_and_resolution_expand_groups(self) -> None:
+        class GroupedToolA(Tool):
+            name = "COMPOSIO_SEARCH_TOOLS"
+            capability = "composio"
+            capability_description = "Search and execute Composio app actions."
+            description = "Search tools."
+            parameters = {"type": "object", "properties": {}}
+
+            def execute(self, **kwargs: Any) -> str:
+                return "a"
+
+        class GroupedToolB(Tool):
+            name = "COMPOSIO_MULTI_EXECUTE_TOOL"
+            capability = "composio"
+            capability_description = "Search and execute Composio app actions."
+            description = "Execute tools."
+            parameters = {"type": "object", "properties": {}}
+
+            def execute(self, **kwargs: Any) -> str:
+                return "b"
+
+        registry = ToolRegistry()
+        registry.register(GroupedToolA())
+        registry.register(GroupedToolB())
+        registry.register(WorkerOnlyTool())
+
+        self.assertEqual(
+            registry.capability_names(chat_agent=False),
+            ["composio", "worker_secret"],
+        )
+        catalog = registry.capability_catalog_text(chat_agent=False)
+        self.assertIn("- composio: Search and execute Composio app actions.", catalog)
+        self.assertNotIn("COMPOSIO_SEARCH_TOOLS", catalog)
+        self.assertEqual(
+            registry.resolve_worker_tools(["composio"]),
+            ["COMPOSIO_MULTI_EXECUTE_TOOL", "COMPOSIO_SEARCH_TOOLS"],
+        )
+        # Explicit individual tool names still resolve directly.
+        self.assertEqual(
+            registry.resolve_worker_tools(["COMPOSIO_SEARCH_TOOLS"]),
+            ["COMPOSIO_SEARCH_TOOLS"],
+        )

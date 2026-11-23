@@ -20,11 +20,15 @@ class ComposioTool(Tool):
         description: str,
         parameters: dict[str, Any],
         hub: ComposioHub,
+        capability: str = "composio",
+        capability_description: str | None = None,
     ) -> None:
         self.name = name
         self.description = description
         self.parameters = parameters
         self._hub = hub
+        self.capability = capability
+        self.capability_description = capability_description
 
     def execute(self, **kwargs: Any) -> Any:
         return self._hub.execute(self.name, kwargs)

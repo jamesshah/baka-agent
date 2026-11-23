@@ -43,7 +43,6 @@ from tools import (
     LinkComposioTool,
     LinkSnaptradeTool,
     ManageMemoryTool,
-    SendAcknowledgementTool,
     SnaptradeStatusTool,
     SpawnAgentTool,
     ToolRegistry,
@@ -94,6 +93,7 @@ _retriever = (
         lexical_weight=_settings.memory_lexical_weight,
         vector_weight=_settings.memory_vector_weight,
         minimum_vector_score=_settings.memory_minimum_vector_score,
+        minimum_skill_score=_settings.memory_minimum_skill_score,
     )
     if _memory_repository is not None
     else None
@@ -136,8 +136,7 @@ _executor = ExecutorAgent(
 )
 
 _tools.register(GetCurrentTimeTool())
-_tools.register(SendAcknowledgementTool())
-_tools.register(SpawnAgentTool(_executor, _context_builder))
+_tools.register(SpawnAgentTool(_executor))
 if _memory_repository is not None:
     _tools.register(ManageMemoryTool(_memory_repository, _embeddings))
 
@@ -329,6 +328,8 @@ def _start_composio() -> ComposioHub | None:
     hub = ComposioHub(
         api_key=_settings.composio_api_key,
         toolkits=_settings.composio_toolkit_list,
+        sandbox_enabled=_settings.composio_sandbox_enabled,
+        compact_schemas=_settings.composio_compact_schemas,
     )
     hub.start()
     _register_composio_tools(hub)
