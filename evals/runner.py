@@ -74,6 +74,7 @@ class CaseRunResult:
     llm_calls: list[dict[str, Any]]
     created_events: list[dict[str, Any]]
     listed_events_count: int
+    trace_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -82,6 +83,7 @@ class CaseRunResult:
             "mode": self.mode,
             "repeat": self.repeat,
             "effective_surface": self.effective_surface,
+            "trace_id": self.trace_id,
             "ablation": {
                 "history_mode": self.ablation.history_mode,
                 "context_mode": self.ablation.context_mode,
@@ -290,7 +292,18 @@ def run_case(
                 request_preview=f"[{case.id}] {case.user_text}",
                 response_preview=f"[{status_label}] {final_reply}",
             )
+        raw_span = getattr(case_span, "_span", None)
+        trace_id = getattr(raw_span, "request_id", None) or getattr(
+            raw_span, "trace_id", None
+        )
     flush_traces()
+    if not trace_id:
+        try:
+            import mlflow  # type: ignore[import-untyped]
+
+            trace_id = mlflow.get_last_active_trace_id()
+        except Exception:  # noqa: BLE001
+            trace_id = None
 
     return CaseRunResult(
         case_id=case.id,
@@ -313,4 +326,5 @@ def run_case(
         llm_calls=llm_calls,
         created_events=world.created_events,
         listed_events_count=world.listed_events_count,
+        trace_id=str(trace_id) if trace_id else None,
     )

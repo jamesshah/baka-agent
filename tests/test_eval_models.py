@@ -795,31 +795,25 @@ class EvalHarnessTests(unittest.TestCase):
                 exp = client.get_experiment_by_name("baka-model-evals")
                 self.assertIsNotNone(exp)
                 runs = client.search_runs([exp.experiment_id])
-                # 1 parent suite run + 2 nested child case runs = 3 runs
-                self.assertEqual(len(runs), 3)
-                parent_runs = [
-                    r for r in runs if "mlflow.parentRunId" not in r.data.tags
-                ]
-                child_runs = [
-                    r for r in runs if "mlflow.parentRunId" in r.data.tags
-                ]
-                self.assertEqual(len(parent_runs), 1)
-                self.assertEqual(len(child_runs), 2)
+                self.assertEqual(len(runs), 1)
+                parent_run = runs[0]
                 self.assertEqual(
-                    parent_runs[0].data.tags.get("eval.status"), "COMPLETED"
+                    parent_run.data.tags.get("eval.status"), "COMPLETED"
                 )
                 self.assertEqual(
-                    parent_runs[0].data.metrics.get("completed_cases"), 2.0
+                    parent_run.data.metrics.get("completed_cases"), 2.0
                 )
-                child_case_ids = {
-                    r.data.params.get("case_id") for r in child_runs
-                }
-                self.assertEqual(
-                    child_case_ids,
-                    {"direct_composio_status", "clean_t56_bedtime_create"},
+                traces = client.search_traces(
+                    locations=[exp.experiment_id],
+                    run_id=parent_run.info.run_id,
                 )
-                traces = client.search_traces(experiment_ids=[exp.experiment_id])
-                self.assertGreaterEqual(len(traces), 2)
+                self.assertEqual(len(traces), 2)
+                self.assertEqual(len(traces[0].info.assessments), 5)
+                datasets = mlflow.genai.search_datasets(
+                    experiment_ids=[exp.experiment_id]
+                )
+                self.assertEqual(len(datasets), 1)
+                self.assertEqual(datasets[0].name, "baka_eval_suite")
             finally:
                 reset_tracing_for_tests()
 

@@ -277,8 +277,65 @@ def _cases_table_data(cases: list[dict[str, Any]]) -> dict[str, list[Any]]:
     return {col: [r[col] for r in rows] for col in cols}
 
 
+def _sync_mlflow_dataset(
+    mlflow: Any,
+    client: Any,
+    *,
+    experiment_id: str,
+    run_id: str,
+    dataset_name: str = "baka_eval_suite",
+) -> None:
+    """Register/update the 13-case benchmark dataset in MLflow GenAI Datasets and link it to run_id."""
+    try:
+        from mlflow.entities import DatasetInput  # type: ignore[import-untyped]
+        from evals.cases import all_cases
+
+        cases = all_cases()
+        existing = [
+            d
+            for d in mlflow.genai.search_datasets(experiment_ids=[experiment_id])
+            if getattr(d, "name", None) == dataset_name
+        ]
+        if existing:
+            ds = mlflow.genai.get_dataset(dataset_id=existing[0].dataset_id)
+        else:
+            ds = mlflow.genai.create_dataset(
+                name=dataset_name,
+                experiment_id=experiment_id,
+                tags={"suite": "lfm3_vs_gemma", "cases": str(len(cases))},
+            )
+        records = [
+            {
+                "inputs": {
+                    "case_id": c.id,
+                    "category": c.category,
+                    "mode": c.mode,
+                    "user_text": c.user_text,
+                    "prior_turns_count": len(c.prior_turns),
+                    "has_polluted_context": bool(c.memory_context),
+                    "tool_surface": c.tool_surface or "full_composio",
+                },
+                "expectations": {
+                    "expected_route": c.expected_route,
+                    "expected_direct_tools": list(c.expected_direct_tools),
+                    "calendar_intent": c.calendar_intent,
+                    "forbid_snaptrade": c.forbid_snaptrade,
+                    "require_search_grant": c.require_search_grant,
+                },
+            }
+            for c in cases
+        ]
+        ds.merge_records(records)
+        client.log_inputs(
+            run_id=run_id,
+            datasets=[DatasetInput(dataset=ds._to_mlflow_entity())],
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug("Failed to sync MLflow GenAI EvaluationDataset", exc_info=True)
+
+
 class LiveMlflowTracker:
-    """Streams eval suite progress, per-case child runs, and traces live to MLflow."""
+    """Streams eval suite progress, linked per-case traces, assessments, and dataset live to MLflow."""
 
     def __init__(
         self,
@@ -289,6 +346,7 @@ class LiveMlflowTracker:
         self._tracking_uri = tracking_uri
         self._experiment_name = experiment_name
         self._mlflow: Any = None
+        self._client: Any = None
         self._parent_run: Any = None
         self._run_id: str | None = None
         self._total_runs: int = 0
@@ -336,9 +394,31 @@ class LiveMlflowTracker:
                 f"s-{ablation.tool_surface}"
             )
             self._mlflow = mlflow
+            self._client = mlflow.tracking.MlflowClient(tracking_uri=resolved)
             self._total_runs = total_runs
             self._parent_run = mlflow.start_run(run_name=run_name)
             self._run_id = str(self._parent_run.info.run_id)
+            exp_id = str(self._parent_run.info.experiment_id)
+
+            try:
+                from mlflow.utils.mlflow_tags import (  # type: ignore[import-untyped]
+                    MLFLOW_RUN_TYPE,
+                    MLFLOW_RUN_TYPE_GENAI_EVALUATE,
+                )
+
+                self._client.set_tag(
+                    self._run_id, MLFLOW_RUN_TYPE, MLFLOW_RUN_TYPE_GENAI_EVALUATE
+                )
+            except Exception:  # noqa: BLE001
+                pass
+
+            _sync_mlflow_dataset(
+                mlflow,
+                self._client,
+                experiment_id=exp_id,
+                run_id=self._run_id,
+            )
+
             ablation_dict = {
                 "history_mode": ablation.history_mode,
                 "context_mode": ablation.context_mode,
@@ -373,6 +453,7 @@ class LiveMlflowTracker:
         except Exception:  # noqa: BLE001
             logger.warning("MLflow start_suite failed; continuing without live MLflow", exc_info=True)
             self._mlflow = None
+            self._client = None
             self._parent_run = None
             self._run_id = None
             return None
@@ -384,60 +465,54 @@ class LiveMlflowTracker:
         step: int,
         results_so_far: list[CaseRunResult],
     ) -> None:
-        if self._mlflow is None or self._parent_run is None:
+        if self._mlflow is None or self._parent_run is None or self._run_id is None:
             return
         mlflow = self._mlflow
         try:
-            # 1. Log a nested child run so each case is immediately visible in the MLflow Runs tree.
-            child_name = (
-                f"{step:02d}_{result.case_id}"
-                if result.repeat == 1
-                else f"{step:02d}_{result.case_id}_r{result.repeat}"
-            )
             status_str = "PASS" if result.scores.all_passed else "FAIL"
-            tool_names = [str(tc.get("name") or "") for tc in result.tool_calls]
-            failed_reasons = {
-                f"reason_{k}": v
-                for k, v in result.scores.reasons.items()
-                if not getattr(result.scores, k, True)
-            }
-            with mlflow.start_run(run_name=child_name, nested=True):
-                mlflow.log_params(
-                    {
-                        "case_id": result.case_id,
-                        "category": result.category,
-                        "mode": result.mode,
-                        "effective_surface": result.effective_surface,
-                        "repeat": result.repeat,
-                        "tools_called": (", ".join(tool_names) or "(none)")[:500],
-                    }
-                )
-                mlflow.set_tags(
-                    {
-                        "eval.case_id": result.case_id,
-                        "eval.category": result.category,
-                        "eval.result": status_str,
-                        "eval.final_reply": result.final_reply[:500],
-                        **failed_reasons,
-                    }
-                )
-                child_metrics: dict[str, float] = {
-                    "all_passed": 1.0 if result.scores.all_passed else 0.0,
-                    "routing_ok": 1.0 if result.scores.routing_ok else 0.0,
-                    "tool_args_ok": 1.0 if result.scores.tool_args_ok else 0.0,
-                    "no_fabrication": 1.0 if result.scores.no_fabrication else 0.0,
-                    "request_fidelity": 1.0 if result.scores.request_fidelity else 0.0,
-                    "prompt_tokens": float(result.prompt_tokens),
-                    "completion_tokens": float(result.completion_tokens),
-                    "wall_ms": float(result.wall_ms),
-                    "tool_calls": float(len(result.tool_calls)),
-                    "llm_calls": float(result.llm_calls_count),
-                }
-                if result.cache_hit_ratio is not None:
-                    child_metrics["cache_hit_ratio"] = float(result.cache_hit_ratio)
-                mlflow.log_metrics(child_metrics)
+            # 1. Link this case's trace to the evaluation run and attach the 5 binary scorer assessments
+            if result.trace_id:
+                try:
+                    mlflow.flush_trace_async_logging()
+                    from mlflow.entities import (  # type: ignore[import-untyped]
+                        AssessmentSource,
+                        AssessmentSourceType,
+                    )
 
-            # 2. Update the parent suite run's live summary metrics & table at this step.
+                    source = AssessmentSource(
+                        source_type=AssessmentSourceType.CODE,
+                        source_id="eval_models",
+                    )
+                    score_dict = result.scores.to_dict()
+                    reasons = result.scores.reasons
+                    for key in (
+                        "all_passed",
+                        "routing_ok",
+                        "tool_args_ok",
+                        "no_fabrication",
+                        "request_fidelity",
+                    ):
+                        mlflow.log_feedback(
+                            trace_id=result.trace_id,
+                            name=key,
+                            value=bool(score_dict.get(key)),
+                            source=source,
+                            rationale=reasons.get(key)
+                            or (
+                                "All 4 checks passed"
+                                if result.scores.all_passed
+                                else "One or more checks failed"
+                            ),
+                        )
+                    if self._client is not None:
+                        self._client.link_traces_to_run(
+                            run_id=self._run_id,
+                            trace_ids=[result.trace_id],
+                        )
+                except Exception:  # noqa: BLE001
+                    logger.debug("Failed to attach feedback/link trace %s", result.trace_id, exc_info=True)
+
+            # 2. Update the evaluation run's live summary metrics & table at this step.
             running_summary = summarize_results(results_so_far)
             total = max(1, self._total_runs)
             parent_metrics: dict[str, float] = {
