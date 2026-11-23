@@ -186,33 +186,21 @@ class GoldenPolicyLLM(LLMClient):
                 "tool_calls": [_tool_call("c_link_st", "link_snaptrade", {})],
             }
 
-        # Delegation cases: inspect available worker catalog in system prompt.
+        # Delegation cases: inspect available worker capability catalog in system prompt.
         sys_prompt = str(messages[0].get("content") or "")
-        use_flat = "create_calendar_event" in sys_prompt and "COMPOSIO_SEARCH_TOOLS" not in sys_prompt
+        use_flat = "- calendar:" in sys_prompt and "- composio:" not in sys_prompt
 
         if "can’t see it" in lower or "can't see" in lower or "what events are actually" in lower:
-            worker_tools = (
-                ["list_calendar_events"]
-                if use_flat
-                else [
-                    "COMPOSIO_SEARCH_TOOLS",
-                    "COMPOSIO_MANAGE_CONNECTIONS",
-                    "COMPOSIO_MULTI_EXECUTE_TOOL",
-                ]
-            )
+            worker_tools = ["calendar"] if use_flat else ["composio"]
             return {
                 "role": "assistant",
                 "content": "",
                 "tool_calls": [
                     _tool_call(
-                        "c_ack",
-                        "send_acknowledgement",
-                        {"message": "Checking your Google Calendar now…"},
-                    ),
-                    _tool_call(
                         "c_spawn",
                         "spawn_agent",
                         {
+                            "acknowledgement": "Checking your Google Calendar now…",
                             "task": "List today's events on the user's Google Calendar for Wed Nov 11, 2026 and check whether 'Ideal Bedtime' is present.",
                             "tools": worker_tools,
                         },
@@ -220,28 +208,16 @@ class GoldenPolicyLLM(LLMClient):
                 ],
             }
 
-        worker_tools = (
-            ["create_calendar_event"]
-            if use_flat
-            else [
-                "COMPOSIO_SEARCH_TOOLS",
-                "COMPOSIO_MANAGE_CONNECTIONS",
-                "COMPOSIO_MULTI_EXECUTE_TOOL",
-            ]
-        )
+        worker_tools = ["calendar"] if use_flat else ["composio"]
         return {
             "role": "assistant",
             "content": "",
             "tool_calls": [
                 _tool_call(
-                    "c_ack",
-                    "send_acknowledgement",
-                    {"message": "Adding that Ideal Bedtime block to your calendar…"},
-                ),
-                _tool_call(
                     "c_spawn",
                     "spawn_agent",
                     {
+                        "acknowledgement": "Adding that Ideal Bedtime block to your calendar…",
                         "task": (
                             "Create a Google Calendar event titled 'Ideal Bedtime' "
                             "on Wed Nov 11, 2026 from 10:30 PM to 11:00 PM CST "
@@ -484,7 +460,7 @@ class EvalHarnessTests(unittest.TestCase):
         llm = ScriptedEvalLLM(steps)
         result = run_case(case, llm, max_executor_iterations=2)
         self.assertFalse(result.scores.routing_ok)
-        self.assertIn("send_acknowledgement", result.scores.reasons["routing_ok"])
+        self.assertIn("acknowledgement", result.scores.reasons["routing_ok"])
         self.assertFalse(result.scores.tool_args_ok)
         self.assertIn("snaptrade", result.scores.reasons["tool_args_ok"].lower())
         self.assertFalse(result.scores.request_fidelity)
@@ -498,11 +474,11 @@ class EvalHarnessTests(unittest.TestCase):
                 "role": "assistant",
                 "content": "",
                 "tool_calls": [
-                    _tool_call("ack", "send_acknowledgement", {"message": "On it!"}),
                     _tool_call(
                         "sp",
                         "spawn_agent",
                         {
+                            "acknowledgement": "On it!",
                             "task": "Create Ideal Bedtime event on Google Calendar at 10:30 PM.",
                             "tools": [
                                 "COMPOSIO_GET_TOOL_SCHEMAS",
@@ -528,16 +504,13 @@ class EvalHarnessTests(unittest.TestCase):
                 "role": "assistant",
                 "content": "",
                 "tool_calls": [
-                    _tool_call("ack", "send_acknowledgement", {"message": "Retrying…"}),
                     _tool_call(
                         "sp",
                         "spawn_agent",
                         {
+                            "acknowledgement": "Retrying…",
                             "task": "Create Ideal Bedtime event on Google Calendar at 10:30 PM.",
-                            "tools": [
-                                "COMPOSIO_SEARCH_TOOLS",
-                                "COMPOSIO_MULTI_EXECUTE_TOOL",
-                            ],
+                            "tools": ["composio"],
                         },
                     ),
                 ],
@@ -571,20 +544,17 @@ class EvalHarnessTests(unittest.TestCase):
                 "role": "assistant",
                 "content": "",
                 "tool_calls": [
-                    _tool_call("ack", "send_acknowledgement", {"message": "Checking…"}),
                     _tool_call(
                         "sp",
                         "spawn_agent",
                         {
+                            "acknowledgement": "Checking…",
                             "task": (
                                 "Check Google Calendar again for today's events. The user wants "
                                 "a short daily-digest iMessage summarizing what's on the calendar, "
                                 "pulling out the key data (Recovery 53%, Sleep 5.4h, Weightlifting strain)."
                             ),
-                            "tools": [
-                                "COMPOSIO_SEARCH_TOOLS",
-                                "COMPOSIO_MULTI_EXECUTE_TOOL",
-                            ],
+                            "tools": ["composio"],
                         },
                     ),
                 ],
@@ -647,17 +617,17 @@ class EvalHarnessTests(unittest.TestCase):
         # System + current user message only (since history_mode=clean)
         self.assertEqual(len(first_chat_messages), 2)
         self.assertNotIn("<context>", str(first_chat_messages[-1]["content"]))
-        self.assertIn("list_calendar_events", str(first_chat_messages[0]["content"]))
+        self.assertIn("- calendar:", str(first_chat_messages[0]["content"]))
 
-        # 3. Prompt modes: current vs no_negative_priming
+        # 3. Prompt modes: current vs no_negative_priming (both now free of negative SnapTrade priming)
         curr_chat = build_chat_system_prompt("current", "full_composio")
         clean_chat = build_chat_system_prompt("no_negative_priming", "full_composio")
-        self.assertIn("Never call link_snaptrade for Calendar", curr_chat)
+        self.assertNotIn("Never call link_snaptrade for Calendar", curr_chat)
         self.assertNotIn("Never call link_snaptrade for Calendar", clean_chat)
 
         curr_exec = build_executor_system_prompt("current", "full_composio")
         clean_exec = build_executor_system_prompt("no_negative_priming", "full_composio")
-        self.assertIn("Do not use SnapTrade tools for Calendar", curr_exec)
+        self.assertNotIn("Do not use SnapTrade tools for Calendar", curr_exec)
         self.assertNotIn("SnapTrade", clean_exec)
 
     def test_openai_compat_client_omits_unset_sampling_params(self) -> None:

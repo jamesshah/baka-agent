@@ -20,11 +20,15 @@ class McpTool(Tool):
         description: str,
         parameters: dict[str, Any],
         client: MultiServerMcpClient,
+        capability: str | None = None,
+        capability_description: str | None = None,
     ) -> None:
         self.name = name
         self.description = description
         self.parameters = parameters
         self._client = client
+        self.capability = capability
+        self.capability_description = capability_description
 
     def execute(self, **kwargs: Any) -> Any:
         return self._client.call_tool(self.name, kwargs)

@@ -519,6 +519,8 @@ class MockWhoopUnlinkTool(Tool):
 
 class MockGetCurrentTimeTool(Tool):
     name = "get_current_time"
+    capability = "time"
+    capability_description = "Get the current date and time in UTC."
     description = "Get the current date and time in UTC."
     parameters: dict[str, Any] = {
         "type": "object",
@@ -536,6 +538,10 @@ class MockGetCurrentTimeTool(Tool):
 
 class MockQueryEventsTool(Tool):
     name = "query_events"
+    capability = "events"
+    capability_description = (
+        "Query stored connected-service events (e.g. Whoop sleep, recovery, workouts)."
+    )
     description = (
         "Look up the user's stored events from connected services (e.g. Whoop "
         "sleep, recovery, workouts). Use for questions like 'how did I sleep "
@@ -564,8 +570,15 @@ class MockQueryEventsTool(Tool):
         return self._world.record_call("executor", self.name, kwargs, res)
 
 
+_COMPOSIO_CAPABILITY_DESC = (
+    "Search, connect, and run actions in connected Composio apps (googlecalendar)."
+)
+
+
 class MockComposioSearchTools(Tool):
     name = "COMPOSIO_SEARCH_TOOLS"
+    capability = "composio"
+    capability_description = _COMPOSIO_CAPABILITY_DESC
     description = (
         "Search and discover Composio tools by use case across enabled toolkits "
         "(e.g. Google Calendar). Returns matching tool slugs, connection status, "
@@ -635,6 +648,8 @@ class MockComposioSearchTools(Tool):
 
 class MockComposioGetToolSchemas(Tool):
     name = "COMPOSIO_GET_TOOL_SCHEMAS"
+    capability = "composio"
+    capability_description = _COMPOSIO_CAPABILITY_DESC
     description = (
         "Fetch full input parameter schemas for specific Composio tool slugs "
         "discovered via COMPOSIO_SEARCH_TOOLS."
@@ -698,6 +713,8 @@ class MockComposioGetToolSchemas(Tool):
 
 class MockComposioManageConnections(Tool):
     name = "COMPOSIO_MANAGE_CONNECTIONS"
+    capability = "composio"
+    capability_description = _COMPOSIO_CAPABILITY_DESC
     description = (
         "Check or initiate OAuth connections for Composio toolkits "
         "(e.g. 'googlecalendar')."
@@ -751,6 +768,8 @@ class MockComposioManageConnections(Tool):
 
 class MockComposioMultiExecuteTool(Tool):
     name = "COMPOSIO_MULTI_EXECUTE_TOOL"
+    capability = "composio"
+    capability_description = _COMPOSIO_CAPABILITY_DESC
     description = (
         "Execute one or more Composio tools by tool_slug with their JSON arguments."
     )
@@ -896,6 +915,8 @@ class MockComposioMultiExecuteTool(Tool):
 
 class MockComposioRemoteBashTool(Tool):
     name = "COMPOSIO_REMOTE_BASH_TOOL"
+    capability = "composio"
+    capability_description = _COMPOSIO_CAPABILITY_DESC
     description = "Execute bash commands inside a remote Composio sandbox."
     parameters: dict[str, Any] = {
         "type": "object",
@@ -919,6 +940,8 @@ class MockComposioRemoteBashTool(Tool):
 
 class MockComposioRemoteWorkbench(Tool):
     name = "COMPOSIO_REMOTE_WORKBENCH"
+    capability = "composio"
+    capability_description = _COMPOSIO_CAPABILITY_DESC
     description = "Run Python scripts in a remote Composio workbench for bulk data processing."
     parameters: dict[str, Any] = {
         "type": "object",
@@ -942,6 +965,8 @@ class MockComposioRemoteWorkbench(Tool):
 
 class MockFlatListCalendarEventsTool(Tool):
     name = "list_calendar_events"
+    capability = "calendar"
+    capability_description = "List and create Google Calendar events directly."
     description = (
         "List events on the user's Google Calendar for a date range or search query."
     )
@@ -973,6 +998,8 @@ class MockFlatListCalendarEventsTool(Tool):
 
 class MockFlatCreateCalendarEventTool(Tool):
     name = "create_calendar_event"
+    capability = "calendar"
+    capability_description = "List and create Google Calendar events directly."
     description = "Create a new event on the user's Google Calendar."
     parameters: dict[str, Any] = {
         "type": "object",
@@ -1058,8 +1085,7 @@ def register_chat_tools(
     registry: ToolRegistry,
     world: MockWorld,
 ) -> None:
-    """Register ChatAgent-facing account and acknowledgement tools."""
-    registry.register(RecordingSendAckTool(world))
+    """Register ChatAgent-facing account tools."""
     registry.register(MockLinkComposioTool(world))
     registry.register(MockComposioStatusTool(world))
     registry.register(MockUnlinkComposioTool(world))

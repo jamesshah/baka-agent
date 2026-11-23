@@ -578,11 +578,14 @@ class MultiServerMcpClient:
         description = tool.description or f"MCP tool '{tool.name}' from '{server_name}'"
         description = f"[{server_name}] {description}"
         parameters = tool.inputSchema or {"type": "object", "properties": {}}
+        group = sanitize_name(server_name).lower()
         return McpTool(
             name=qualified,
             description=description,
             parameters=parameters,
             client=self,
+            capability=group,
+            capability_description=f"Tools from the {server_name} MCP server.",
         )
 
 

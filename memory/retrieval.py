@@ -22,12 +22,14 @@ class HybridRetriever:
         lexical_weight: float = 0.45,
         vector_weight: float = 0.55,
         minimum_vector_score: float = 0.3,
+        minimum_skill_score: float = 0.35,
     ) -> None:
         self._repository = repository
         self._embeddings = embeddings
         self._lexical_weight = lexical_weight
         self._vector_weight = vector_weight
         self._minimum_vector_score = minimum_vector_score
+        self._minimum_skill_score = minimum_skill_score
 
     def retrieve(
         self,
@@ -145,6 +147,7 @@ class HybridRetriever:
                 key=lambda item: scores[item.id],
                 reverse=True,
             )
+            if scores[hit.id] >= self._minimum_skill_score
         ]
 
 
@@ -207,7 +210,9 @@ class ContextBuilder:
                     chunks.append(chunk[:remaining])
                     remaining -= len(chunk)
                 sections.append(
-                    "Relevant procedural skills (follow when applicable):\n"
+                    "Optional style guides (use ONLY when the user's latest "
+                    "message is directly asking about that topic; ignore for "
+                    "unrelated app actions):\n"
                     + "\n\n".join(chunks)
                 )
             rendered_context = "\n\n".join(sections)

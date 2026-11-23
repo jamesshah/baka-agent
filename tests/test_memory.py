@@ -233,6 +233,14 @@ class MemoryTestCase(unittest.TestCase):
         self.assertIn("python-helper", context)
         self.assertIn("Inspect the traceback", context)
 
+        # Weak unrelated query should not inject the python skill.
+        unrelated = ContextBuilder(
+            HybridRetriever(
+                self.repository, embeddings=FakeEmbeddingClient()
+            )
+        ).render("+15550000001", "add bedtime block to my calendar")
+        self.assertNotIn("python-helper", unrelated)
+
     def test_align_messages_to_user_drops_leading_non_user(self) -> None:
         aligned = align_messages_to_user([
             {"role": "tool", "content": "orphan"},

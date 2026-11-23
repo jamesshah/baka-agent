@@ -72,6 +72,7 @@ def score_case(
     effective_surface: str,
     valid_chat_tools: set[str],
     valid_worker_tools: set[str],
+    valid_capabilities: set[str] | None = None,
 ) -> ScoreBreakdown:
     routing_ok, routing_reason = _score_routing(
         case,
@@ -86,6 +87,7 @@ def score_case(
         effective_surface=effective_surface,
         valid_chat_tools=valid_chat_tools,
         valid_worker_tools=valid_worker_tools,
+        valid_capabilities=valid_capabilities,
     )
     no_fabrication, fab_reason = _score_no_fabrication(
         case,
@@ -152,11 +154,17 @@ def _score_routing(
         return True, f"called direct tool {sorted(expected & called)}"
 
     if case.expected_route == "delegate":
-        if "spawn_agent" not in chat_names:
+        spawn_calls = [c for c in chat_calls if c.get("name") == "spawn_agent"]
+        if not spawn_calls:
             return False, f"expected spawn_agent delegation, got {chat_names}"
-        if "send_acknowledgement" not in chat_names:
-            return False, "called spawn_agent without calling send_acknowledgement"
-        return True, "called send_acknowledgement + spawn_agent"
+        has_inline_ack = any(
+            str((c.get("arguments") or {}).get("acknowledgement") or "").strip()
+            for c in spawn_calls
+        )
+        has_legacy_ack = "send_acknowledgement" in chat_names
+        if not (has_inline_ack or has_legacy_ack):
+            return False, "called spawn_agent without providing a non-empty acknowledgement"
+        return True, "delegated via spawn_agent with acknowledgement"
 
     return False, f"unrecognized expected_route: {case.expected_route}"
 
@@ -169,6 +177,7 @@ def _score_tool_args(
     effective_surface: str,
     valid_chat_tools: set[str],
     valid_worker_tools: set[str],
+    valid_capabilities: set[str] | None = None,
 ) -> tuple[bool, str]:
     # 1. Verify every LLM-proposed tool call has valid JSON args and a registered tool name.
     for call_record in llm_calls:
@@ -218,6 +227,7 @@ def _score_tool_args(
         ]
         if not spawn_calls:
             return False, "no spawn_agent call to validate arguments"
+        allowed_grant_tokens = set(valid_worker_tools) | set(valid_capabilities or set())
         for sp in spawn_calls:
             args = sp.get("arguments") or {}
             task = str(args.get("task") or "").strip()
@@ -226,10 +236,17 @@ def _score_tool_args(
                 return False, "spawn_agent missing non-empty task"
             if not isinstance(raw_tools, list):
                 return False, f"spawn_agent.tools must be a list, got {type(raw_tools).__name__}"
-            granted = {str(t).strip() for t in raw_tools if str(t).strip()}
-            unknown_grants = granted - valid_worker_tools
+            requested_tokens = {str(t).strip() for t in raw_tools if str(t).strip()}
+            unknown_grants = requested_tokens - allowed_grant_tokens
             if unknown_grants:
                 return False, f"spawn_agent granted unknown worker tools: {sorted(unknown_grants)}"
+
+            granted_list = sp.get("granted_tools")
+            granted = (
+                {str(t).strip() for t in granted_list if str(t).strip()}
+                if isinstance(granted_list, list)
+                else requested_tokens
+            )
 
             if case.require_search_grant and case.calendar_intent != "none":
                 if effective_surface in ("full_composio", "slim_composio"):
