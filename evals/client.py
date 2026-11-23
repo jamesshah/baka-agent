@@ -150,12 +150,72 @@ class RecordingLLM(LLMClient):
     ) -> dict[str, Any]:
         if hasattr(self._inner, "last_metrics"):
             self._inner.last_metrics = None  # type: ignore[attr-defined]
-        started = time.perf_counter()
-        message = self._inner.chat(
-            messages, tools=tools, temperature=temperature, timeout=timeout
+        iteration = sum(1 for c in self._calls if c.get("agent") == self._agent) + 1
+        model_name = getattr(self._inner, "model", None) or "eval-llm"
+        sampling_obj = getattr(self._inner, "sampling", None)
+        sampling_sent = (
+            sampling_obj.payload() if hasattr(sampling_obj, "payload") else {}
         )
-        wall_ms = (time.perf_counter() - started) * 1000.0
-        metrics = getattr(self._inner, "last_metrics", None) or {}
+
+        try:
+            from tracing import (
+                prompt_breakdown,
+                sanitize_messages,
+                set_llm_span_metrics,
+                trace_span,
+            )
+
+            breakdown = prompt_breakdown(messages, tools)
+            span_cm = trace_span(
+                f"llm.chat.{self._agent}",
+                span_type="CHAT_MODEL",
+                inputs={
+                    "messages": sanitize_messages(messages),
+                    "tools": breakdown["tool_names"],
+                    "model": model_name,
+                    "sampling": sampling_sent,
+                },
+                attributes={
+                    "agent_label": self._agent,
+                    "iteration": iteration,
+                    "prompt.system_chars": breakdown["system_chars"],
+                    "prompt.tools_chars": breakdown["tools_chars"],
+                    "prompt.tool_count": breakdown["tool_count"],
+                    "prompt.history_messages": breakdown["history_messages"],
+                    "prompt.history_chars": breakdown["history_chars"],
+                    "prompt.context_block_chars": breakdown["context_block_chars"],
+                    "prompt.current_user_chars": breakdown["current_user_chars"],
+                    "prompt.tool_result_messages": breakdown["tool_result_messages"],
+                    "prompt.tool_result_chars": breakdown["tool_result_chars"],
+                    "prompt.total_chars": breakdown["total_chars"],
+                    "prompt.estimated_tokens": breakdown["estimated_tokens"],
+                },
+            )
+        except ImportError:
+            from contextlib import nullcontext
+
+            span_cm = nullcontext(None)  # type: ignore[assignment]
+            set_llm_span_metrics = None  # type: ignore[assignment]
+
+        with span_cm as llm_span:
+            started = time.perf_counter()
+            message = self._inner.chat(
+                messages, tools=tools, temperature=temperature, timeout=timeout
+            )
+            wall_ms = (time.perf_counter() - started) * 1000.0
+            metrics = getattr(self._inner, "last_metrics", None) or {}
+            if llm_span is not None and set_llm_span_metrics is not None:
+                if metrics:
+                    set_llm_span_metrics(llm_span, metrics, tools=tools)
+                llm_span.set_outputs(
+                    {
+                        "role": message.get("role"),
+                        "content": message.get("content"),
+                        "tool_calls": message.get("tool_calls"),
+                        "finish_reason": metrics.get("finish_reason"),
+                    }
+                )
+
         proposed = [
             {
                 "name": (call.get("function") or {}).get("name"),

@@ -163,57 +163,134 @@ def run_case(
     started = time.perf_counter()
     replies: list[str] = []
 
-    if case.mode == "executor":
-        granted = (
-            list(case.executor_granted_tools)
-            if case.executor_granted_tools is not None
-            else surface_worker_tool_names(effective_surface)
-        )
-        token = set_session_id(EVAL_SESSION_ID)
-        try:
-            final_reply = executor.run_task(
-                EVAL_SESSION_ID,
-                case.user_text,
-                tool_names=granted,
+    try:
+        from tracing import flush_traces, trace_span
+    except ImportError:
+        from contextlib import nullcontext
+
+        def trace_span(*_a: Any, **_kw: Any) -> Any:  # type: ignore[misc]
+            return nullcontext(None)
+
+        def flush_traces() -> None:
+            return None
+
+    with trace_span(
+        f"eval_case:{case.id}",
+        span_type="EVALUATOR",
+        inputs={
+            "case_id": case.id,
+            "category": case.category,
+            "mode": case.mode,
+            "repeat": repeat,
+            "user_text": case.user_text,
+            "effective_surface": effective_surface,
+            "ablation": {
+                "history_mode": ablation.history_mode,
+                "context_mode": ablation.context_mode,
+                "prompt_mode": ablation.prompt_mode,
+                "tool_surface": ablation.tool_surface,
+            },
+        },
+        attributes={
+            "case_id": case.id,
+            "category": case.category,
+            "mode": case.mode,
+            "repeat": repeat,
+            "effective_surface": effective_surface,
+        },
+    ) as case_span:
+        if case.mode == "executor":
+            granted = (
+                list(case.executor_granted_tools)
+                if case.executor_granted_tools is not None
+                else surface_worker_tool_names(effective_surface)
             )
-        finally:
-            reset_session_id(token)
-        replies = [final_reply]
-    else:
-        chat_prompt = build_chat_system_prompt(ablation.prompt_mode, effective_surface)
-        chat_agent = ChatAgent(
-            llm=chat_llm,
-            tools=registry,
-            system_prompt=chat_prompt,
-            max_history_messages=40,
-            max_agent_iterations=max_chat_iterations,
-            context_builder=context_builder,  # type: ignore[arg-type]
-        )
-        prior_messages = select_history_messages(
-            case.prior_turns, ablation.history_mode
-        )
-        if prior_messages:
-            chat_agent._histories[EVAL_SESSION_ID] = [
-                {"role": "system", "content": chat_agent._render_system_prompt()},
-                *prior_messages,
-            ]
-        replies = list(chat_agent.run_turn(EVAL_SESSION_ID, case.user_text))
-        final_reply = replies[-1] if replies else ""
+            token = set_session_id(EVAL_SESSION_ID)
+            try:
+                final_reply = executor.run_task(
+                    EVAL_SESSION_ID,
+                    case.user_text,
+                    tool_names=granted,
+                )
+            finally:
+                reset_session_id(token)
+            replies = [final_reply]
+        else:
+            chat_prompt = build_chat_system_prompt(ablation.prompt_mode, effective_surface)
+            chat_agent = ChatAgent(
+                llm=chat_llm,
+                tools=registry,
+                system_prompt=chat_prompt,
+                max_history_messages=40,
+                max_agent_iterations=max_chat_iterations,
+                context_builder=context_builder,  # type: ignore[arg-type]
+            )
+            prior_messages = select_history_messages(
+                case.prior_turns, ablation.history_mode
+            )
+            if prior_messages:
+                chat_agent._histories[EVAL_SESSION_ID] = [
+                    {"role": "system", "content": chat_agent._render_system_prompt()},
+                    *prior_messages,
+                ]
+            replies = list(chat_agent.run_turn(EVAL_SESSION_ID, case.user_text))
+            final_reply = replies[-1] if replies else ""
 
-    wall_ms = round((time.perf_counter() - started) * 1000.0, 2)
-    totals = usage_totals(llm_calls)
+        wall_ms = round((time.perf_counter() - started) * 1000.0, 2)
+        totals = usage_totals(llm_calls)
 
-    scores = score_case(
-        case,
-        final_reply=final_reply,
-        tool_calls=world.tool_calls,
-        llm_calls=llm_calls,
-        created_events=world.created_events,
-        listed_events_count=world.listed_events_count,
-        effective_surface=effective_surface,
-        valid_chat_tools=valid_chat_tools,
-        valid_worker_tools=valid_worker_tools,
-    )
+        scores = score_case(
+            case,
+            final_reply=final_reply,
+            tool_calls=world.tool_calls,
+            llm_calls=llm_calls,
+            created_events=world.created_events,
+            listed_events_count=world.listed_events_count,
+            effective_surface=effective_surface,
+            valid_chat_tools=valid_chat_tools,
+            valid_worker_tools=valid_worker_tools,
+        )
+
+        if case_span is not None:
+            status_label = "PASS" if scores.all_passed else "FAIL"
+            case_span.set_attributes(
+                {
+                    "eval.result": status_label,
+                    "eval.routing_ok": scores.routing_ok,
+                    "eval.tool_args_ok": scores.tool_args_ok,
+                    "eval.no_fabrication": scores.no_fabrication,
+                    "eval.request_fidelity": scores.request_fidelity,
+                    "eval.prompt_tokens": totals["prompt_tokens"],
+                    "eval.completion_tokens": totals["completion_tokens"],
+                    "eval.cache_hit_ratio": totals["cache_hit_ratio"],
+                    "eval.wall_ms": wall_ms,
+                }
+            )
+            case_span.set_outputs(
+                {
+                    "result": status_label,
+                    "final_reply": final_reply,
+                    "scores": scores.to_dict(),
+                    "tool_calls": [tc.get("name") for tc in world.tool_calls],
+                    "created_events": len(world.created_events),
+                    "listed_events_count": world.listed_events_count,
+                }
+            )
+            case_span.update_trace(
+                tags={
+                    "case_id": case.id,
+                    "category": case.category,
+                    "surface": effective_surface,
+                    "result": status_label,
+                    "routing_ok": str(scores.routing_ok),
+                    "tool_args_ok": str(scores.tool_args_ok),
+                    "no_fabrication": str(scores.no_fabrication),
+                    "request_fidelity": str(scores.request_fidelity),
+                },
+                request_preview=f"[{case.id}] {case.user_text}",
+                response_preview=f"[{status_label}] {final_reply}",
+            )
+    flush_traces()
 
     return CaseRunResult(
         case_id=case.id,

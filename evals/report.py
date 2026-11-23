@@ -214,49 +214,282 @@ def write_report_files(
     return json_path, md_path
 
 
-def log_to_mlflow(
-    payload: dict[str, Any],
-    *,
-    json_path: Path | None = None,
-    md_path: Path | None = None,
-    tracking_uri: str = DEFAULT_MLFLOW_URI,
-    experiment_name: str = "baka-model-evals",
-) -> str | None:
-    """Soft-import ``mlflow`` and log params, summary metrics, and artifacts."""
-    try:
-        import mlflow  # type: ignore[import-not-found]
-    except ImportError:
-        logger.warning("mlflow is not installed; skipping --mlflow logging")
-        return None
+def _prepare_mlflow_experiment(
+    mlflow: Any,
+    tracking_uri: str,
+    experiment_name: str,
+) -> str:
+    """Resolve SQLite tracking URI and keep artifacts next to the DB under .data/mlflow-artifacts."""
+    resolved = tracking_uri.strip() or DEFAULT_MLFLOW_URI
+    artifact_loc: str | None = None
+    if resolved.startswith("sqlite:///") and resolved != "sqlite:///:memory:":
+        raw_path = resolved[len("sqlite:///") :]
+        db_path = Path(raw_path)
+        if not db_path.is_absolute():
+            db_path = (Path.cwd() / db_path).resolve()
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        resolved = f"sqlite:///{db_path}"
+        artifacts_dir = db_path.parent / "mlflow-artifacts"
+        artifacts_dir.mkdir(parents=True, exist_ok=True)
+        artifact_loc = artifacts_dir.as_uri()
+    mlflow.set_tracking_uri(resolved)
+    if artifact_loc and mlflow.get_experiment_by_name(experiment_name) is None:
+        mlflow.create_experiment(experiment_name, artifact_location=artifact_loc)
+    mlflow.set_experiment(experiment_name)
+    return resolved
 
-    try:
-        if tracking_uri.startswith("sqlite:///"):
-            db_rel = tracking_uri[len("sqlite:///") :]
-            if db_rel:
-                Path(db_rel).parent.mkdir(parents=True, exist_ok=True)
-        mlflow.set_tracking_uri(tracking_uri)
-        mlflow.set_experiment(experiment_name)
-        ablation = payload.get("ablation") or {}
-        sampling = payload.get("sampling") or {}
-        summary = payload.get("summary") or {}
-        run_name = (
-            f"{payload.get('model', 'model')}_"
-            f"h-{ablation.get('history_mode')}_"
-            f"c-{ablation.get('context_mode')}_"
-            f"p-{ablation.get('prompt_mode')}_"
-            f"s-{ablation.get('tool_surface')}"
+
+def _cases_table_data(cases: list[dict[str, Any]]) -> dict[str, list[Any]]:
+    rows: list[dict[str, Any]] = []
+    for item in cases:
+        sc = item.get("scores") or {}
+        mt = item.get("metrics") or {}
+        reasons = sc.get("reasons") or {}
+        tool_names = [str(tc.get("name") or "") for tc in (item.get("tool_calls") or [])]
+        rows.append(
+            {
+                "case_id": item.get("case_id"),
+                "category": item.get("category"),
+                "surface": item.get("effective_surface"),
+                "repeat": item.get("repeat"),
+                "status": "PASS" if sc.get("all_passed") else "FAIL",
+                "all_passed": sc.get("all_passed"),
+                "routing_ok": sc.get("routing_ok"),
+                "tool_args_ok": sc.get("tool_args_ok"),
+                "no_fabrication": sc.get("no_fabrication"),
+                "request_fidelity": sc.get("request_fidelity"),
+                "prompt_tokens": mt.get("prompt_tokens"),
+                "completion_tokens": mt.get("completion_tokens"),
+                "cache_hit_ratio": mt.get("cache_hit_ratio"),
+                "wall_ms": mt.get("wall_ms"),
+                "tools_called": ", ".join(tool_names) if tool_names else "(none)",
+                "failure_reasons": "; ".join(
+                    f"{k}: {reasons.get(k)}"
+                    for k in ("routing_ok", "tool_args_ok", "no_fabrication", "request_fidelity")
+                    if not sc.get(k)
+                ),
+                "final_reply": item.get("final_reply"),
+            }
         )
-        with mlflow.start_run(run_name=run_name) as run:
+    if not rows:
+        return {}
+    cols = list(rows[0].keys())
+    return {col: [r[col] for r in rows] for col in cols}
+
+
+class LiveMlflowTracker:
+    """Streams eval suite progress, per-case child runs, and traces live to MLflow."""
+
+    def __init__(
+        self,
+        *,
+        tracking_uri: str = DEFAULT_MLFLOW_URI,
+        experiment_name: str = "baka-model-evals",
+    ) -> None:
+        self._tracking_uri = tracking_uri
+        self._experiment_name = experiment_name
+        self._mlflow: Any = None
+        self._parent_run: Any = None
+        self._run_id: str | None = None
+        self._total_runs: int = 0
+
+    @property
+    def run_id(self) -> str | None:
+        return self._run_id
+
+    def start_suite(
+        self,
+        *,
+        model: str,
+        base_url: str,
+        ablation: AblationConfig,
+        sampling: SamplingParams,
+        repeats: int,
+        total_runs: int,
+    ) -> str | None:
+        try:
+            import mlflow  # type: ignore[import-not-found]
+        except ImportError:
+            logger.warning("mlflow is not installed; skipping --mlflow logging")
+            return None
+
+        try:
+            resolved = _prepare_mlflow_experiment(
+                mlflow, self._tracking_uri, self._experiment_name
+            )
+            try:
+                from tracing import configure_tracing
+
+                configure_tracing(
+                    enabled=True,
+                    tracking_uri=resolved,
+                    experiment=self._experiment_name,
+                )
+            except ImportError:
+                pass
+
+            run_name = (
+                f"{model}_"
+                f"h-{ablation.history_mode}_"
+                f"c-{ablation.context_mode}_"
+                f"p-{ablation.prompt_mode}_"
+                f"s-{ablation.tool_surface}"
+            )
+            self._mlflow = mlflow
+            self._total_runs = total_runs
+            self._parent_run = mlflow.start_run(run_name=run_name)
+            self._run_id = str(self._parent_run.info.run_id)
+            ablation_dict = {
+                "history_mode": ablation.history_mode,
+                "context_mode": ablation.context_mode,
+                "prompt_mode": ablation.prompt_mode,
+                "tool_surface": ablation.tool_surface,
+                "override_case_surface": ablation.override_case_surface,
+            }
             params: dict[str, Any] = {
-                "model": payload.get("model"),
-                "base_url": payload.get("base_url"),
-                "repeats": payload.get("repeats"),
-                **{f"ablation_{k}": v for k, v in ablation.items()},
-                **{f"sampling_{k}": v for k, v in sampling.items()},
+                "model": model,
+                "base_url": base_url,
+                "repeats": repeats,
+                "total_cases": total_runs,
+                **{f"ablation_{k}": v for k, v in ablation_dict.items()},
+                **{f"sampling_{k}": v for k, v in sampling.payload().items()},
             }
             mlflow.log_params(params)
+            mlflow.set_tags(
+                {
+                    "eval.status": "RUNNING",
+                    "eval.progress": f"0/{total_runs}",
+                }
+            )
+            mlflow.log_metrics(
+                {
+                    "completed_cases": 0.0,
+                    "total_cases": float(total_runs),
+                    "progress_pct": 0.0,
+                },
+                step=0,
+            )
+            return self._run_id
+        except Exception:  # noqa: BLE001
+            logger.warning("MLflow start_suite failed; continuing without live MLflow", exc_info=True)
+            self._mlflow = None
+            self._parent_run = None
+            self._run_id = None
+            return None
 
+    def log_case_step(
+        self,
+        result: CaseRunResult,
+        *,
+        step: int,
+        results_so_far: list[CaseRunResult],
+    ) -> None:
+        if self._mlflow is None or self._parent_run is None:
+            return
+        mlflow = self._mlflow
+        try:
+            # 1. Log a nested child run so each case is immediately visible in the MLflow Runs tree.
+            child_name = (
+                f"{step:02d}_{result.case_id}"
+                if result.repeat == 1
+                else f"{step:02d}_{result.case_id}_r{result.repeat}"
+            )
+            status_str = "PASS" if result.scores.all_passed else "FAIL"
+            tool_names = [str(tc.get("name") or "") for tc in result.tool_calls]
+            failed_reasons = {
+                f"reason_{k}": v
+                for k, v in result.scores.reasons.items()
+                if not getattr(result.scores, k, True)
+            }
+            with mlflow.start_run(run_name=child_name, nested=True):
+                mlflow.log_params(
+                    {
+                        "case_id": result.case_id,
+                        "category": result.category,
+                        "mode": result.mode,
+                        "effective_surface": result.effective_surface,
+                        "repeat": result.repeat,
+                        "tools_called": (", ".join(tool_names) or "(none)")[:500],
+                    }
+                )
+                mlflow.set_tags(
+                    {
+                        "eval.case_id": result.case_id,
+                        "eval.category": result.category,
+                        "eval.result": status_str,
+                        "eval.final_reply": result.final_reply[:500],
+                        **failed_reasons,
+                    }
+                )
+                child_metrics: dict[str, float] = {
+                    "all_passed": 1.0 if result.scores.all_passed else 0.0,
+                    "routing_ok": 1.0 if result.scores.routing_ok else 0.0,
+                    "tool_args_ok": 1.0 if result.scores.tool_args_ok else 0.0,
+                    "no_fabrication": 1.0 if result.scores.no_fabrication else 0.0,
+                    "request_fidelity": 1.0 if result.scores.request_fidelity else 0.0,
+                    "prompt_tokens": float(result.prompt_tokens),
+                    "completion_tokens": float(result.completion_tokens),
+                    "wall_ms": float(result.wall_ms),
+                    "tool_calls": float(len(result.tool_calls)),
+                    "llm_calls": float(result.llm_calls_count),
+                }
+                if result.cache_hit_ratio is not None:
+                    child_metrics["cache_hit_ratio"] = float(result.cache_hit_ratio)
+                mlflow.log_metrics(child_metrics)
+
+            # 2. Update the parent suite run's live summary metrics & table at this step.
+            running_summary = summarize_results(results_so_far)
+            total = max(1, self._total_runs)
+            parent_metrics: dict[str, float] = {
+                "completed_cases": float(step),
+                "progress_pct": round(100.0 * step / total, 2),
+                "passed_all": float(running_summary.get("passed_all") or 0),
+                "pass_all_rate": float(running_summary.get("pass_all_rate") or 0.0),
+                "routing_ok_rate": float(running_summary.get("routing_ok_rate") or 0.0),
+                "tool_args_ok_rate": float(running_summary.get("tool_args_ok_rate") or 0.0),
+                "no_fabrication_rate": float(running_summary.get("no_fabrication_rate") or 0.0),
+                "request_fidelity_rate": float(running_summary.get("request_fidelity_rate") or 0.0),
+                "total_prompt_tokens": float(running_summary.get("total_prompt_tokens") or 0),
+                "total_completion_tokens": float(running_summary.get("total_completion_tokens") or 0),
+                "total_wall_ms": float(running_summary.get("total_wall_ms") or 0.0),
+            }
+            if running_summary.get("mean_cache_hit_ratio") is not None:
+                parent_metrics["mean_cache_hit_ratio"] = float(
+                    running_summary["mean_cache_hit_ratio"]
+                )
+            mlflow.log_metrics(parent_metrics, step=step)
+            mlflow.set_tags(
+                {
+                    "eval.status": "RUNNING",
+                    "eval.progress": f"{step}/{self._total_runs}",
+                    "eval.last_case": f"{result.case_id} ({status_str})",
+                }
+            )
+            if hasattr(mlflow, "log_table"):
+                table_data = _cases_table_data([r.to_dict() for r in results_so_far])
+                if table_data:
+                    mlflow.log_table(data=table_data, artifact_file="eval_cases.json")
+        except Exception:  # noqa: BLE001
+            logger.warning("MLflow log_case_step failed", exc_info=True)
+
+    def finish_suite(
+        self,
+        payload: dict[str, Any],
+        *,
+        json_path: Path | None = None,
+        md_path: Path | None = None,
+    ) -> str | None:
+        if self._mlflow is None or self._parent_run is None:
+            return None
+        mlflow = self._mlflow
+        try:
+            summary = payload.get("summary") or {}
+            total = int(summary.get("total_runs") or 0)
+            passed = int(summary.get("passed_all") or 0)
             metrics: dict[str, float] = {
+                "completed_cases": float(total),
+                "progress_pct": 100.0 if total else 0.0,
+                "passed_all": float(passed),
                 "pass_all_rate": float(summary.get("pass_all_rate") or 0.0),
                 "routing_ok_rate": float(summary.get("routing_ok_rate") or 0.0),
                 "tool_args_ok_rate": float(summary.get("tool_args_ok_rate") or 0.0),
@@ -268,40 +501,72 @@ def log_to_mlflow(
             }
             if summary.get("mean_cache_hit_ratio") is not None:
                 metrics["mean_cache_hit_ratio"] = float(summary["mean_cache_hit_ratio"])
-            mlflow.log_metrics(metrics)
-
+            mlflow.log_metrics(metrics, step=total)
+            mlflow.set_tags(
+                {
+                    "eval.status": "COMPLETED",
+                    "eval.progress": f"{total}/{total}",
+                    "eval.pass_summary": f"{passed}/{total} ({float(summary.get('pass_all_rate') or 0.0) * 100:.1f}%)",
+                }
+            )
             if hasattr(mlflow, "log_table"):
-                rows = []
-                for item in payload.get("cases") or []:
-                    sc = item.get("scores") or {}
-                    mt = item.get("metrics") or {}
-                    rows.append(
-                        {
-                            "case_id": item.get("case_id"),
-                            "category": item.get("category"),
-                            "surface": item.get("effective_surface"),
-                            "repeat": item.get("repeat"),
-                            "routing_ok": sc.get("routing_ok"),
-                            "tool_args_ok": sc.get("tool_args_ok"),
-                            "no_fabrication": sc.get("no_fabrication"),
-                            "request_fidelity": sc.get("request_fidelity"),
-                            "all_passed": sc.get("all_passed"),
-                            "prompt_tokens": mt.get("prompt_tokens"),
-                            "completion_tokens": mt.get("completion_tokens"),
-                            "wall_ms": mt.get("wall_ms"),
-                            "final_reply": item.get("final_reply"),
-                        }
-                    )
-                if rows:
-                    cols = list(rows[0].keys())
-                    table_data = {col: [r[col] for r in rows] for col in cols}
+                table_data = _cases_table_data(payload.get("cases") or [])
+                if table_data:
                     mlflow.log_table(data=table_data, artifact_file="eval_cases.json")
-
             if json_path is not None and json_path.exists():
                 mlflow.log_artifact(str(json_path))
             if md_path is not None and md_path.exists():
                 mlflow.log_artifact(str(md_path))
-            return str(run.info.run_id)
-    except Exception:  # noqa: BLE001
-        logger.warning("MLflow logging failed; continuing cleanly", exc_info=True)
+            return self._run_id
+        except Exception:  # noqa: BLE001
+            logger.warning("MLflow finish_suite failed; continuing cleanly", exc_info=True)
+            return None
+        finally:
+            try:
+                mlflow.end_run()
+            except Exception:  # noqa: BLE001
+                pass
+            self._parent_run = None
+
+
+def log_to_mlflow(
+    payload: dict[str, Any],
+    *,
+    json_path: Path | None = None,
+    md_path: Path | None = None,
+    tracking_uri: str = DEFAULT_MLFLOW_URI,
+    experiment_name: str = "baka-model-evals",
+) -> str | None:
+    """One-shot helper to log a completed report payload to MLflow."""
+    ablation_raw = payload.get("ablation") or {}
+    sampling_raw = payload.get("sampling") or {}
+    ablation = AblationConfig(
+        history_mode=ablation_raw.get("history_mode", "full"),
+        context_mode=ablation_raw.get("context_mode", "full"),
+        prompt_mode=ablation_raw.get("prompt_mode", "current"),
+        tool_surface=ablation_raw.get("tool_surface", "full_composio"),
+        override_case_surface=bool(ablation_raw.get("override_case_surface", False)),
+    )
+    sampling = SamplingParams(
+        temperature=sampling_raw.get("temperature"),
+        top_p=sampling_raw.get("top_p"),
+        top_k=sampling_raw.get("top_k"),
+        repeat_penalty=sampling_raw.get("repeat_penalty"),
+        seed=sampling_raw.get("seed"),
+    )
+    cases = payload.get("cases") or []
+    tracker = LiveMlflowTracker(
+        tracking_uri=tracking_uri,
+        experiment_name=experiment_name,
+    )
+    run_id = tracker.start_suite(
+        model=str(payload.get("model") or "model"),
+        base_url=str(payload.get("base_url") or ""),
+        ablation=ablation,
+        sampling=sampling,
+        repeats=int(payload.get("repeats") or 1),
+        total_runs=len(cases),
+    )
+    if run_id is None:
         return None
+    return tracker.finish_suite(payload, json_path=json_path, md_path=md_path)

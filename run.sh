@@ -32,9 +32,11 @@ LOG_DIR="${RUN_DIR}/logs"
 LLAMA_PID_FILE="${RUN_DIR}/llama-server.pid"
 EMBED_PID_FILE="${RUN_DIR}/embedding-server.pid"
 AGENT_PID_FILE="${RUN_DIR}/agent.pid"
+MLFLOW_PID_FILE="${RUN_DIR}/mlflow.pid"
 LLAMA_LOG="${LOG_DIR}/llama-server.log"
 EMBED_LOG="${LOG_DIR}/embedding-server.log"
 AGENT_LOG="${LOG_DIR}/agent.log"
+MLFLOW_LOG="${LOG_DIR}/mlflow.log"
 
 # Load one KEY from .env if unset. Does not `source` the file (avoids bash
 # breaking on spaces/special chars in other values like secrets).
@@ -433,6 +435,37 @@ resolve_mlflow_uri() {
   printf '%s' "${uri}"
 }
 
+start_mlflow_bg() {
+  local open_browser="${1:-1}"
+  local mlflow_bin="${ROOT}/.venv/bin/mlflow"
+  if [[ ! -x "${mlflow_bin}" ]]; then
+    echo "Missing ${mlflow_bin}. Install dependencies first: .venv/bin/pip install -r requirements.txt" >&2
+    exit 1
+  fi
+  local uri
+  uri="$(resolve_mlflow_uri)"
+  local ui_url="http://127.0.0.1:${MLFLOW_PORT}"
+  mkdir -p "${ROOT}/.data"
+
+  if curl -sf "${ui_url}" >/dev/null 2>&1; then
+    echo "MLflow UI already running at ${ui_url}"
+  else
+    echo "Starting MLflow UI (${uri}) in background on ${ui_url} (log: ${MLFLOW_LOG})…"
+    nohup "${mlflow_bin}" ui \
+      --backend-store-uri "${uri}" \
+      --host 127.0.0.1 \
+      --port "${MLFLOW_PORT}" \
+      --workers 1 \
+      >>"${MLFLOW_LOG}" 2>&1 &
+    echo $! >"${MLFLOW_PID_FILE}"
+    wait_for_url "${ui_url}" "MLflow UI" 30
+  fi
+
+  if [[ "${open_browser}" -eq 1 ]] && command -v open >/dev/null 2>&1; then
+    open "${ui_url}"
+  fi
+}
+
 cmd_mlflow() {
   local open_browser=1
   if [[ "${1:-}" == "--no-open" ]]; then
@@ -447,6 +480,13 @@ cmd_mlflow() {
   uri="$(resolve_mlflow_uri)"
   local ui_url="http://127.0.0.1:${MLFLOW_PORT}"
   mkdir -p "${ROOT}/.data"
+  if curl -sf "${ui_url}" >/dev/null 2>&1; then
+    echo "MLflow UI is already running at ${ui_url}"
+    if [[ "${open_browser}" -eq 1 ]] && command -v open >/dev/null 2>&1; then
+      open "${ui_url}"
+    fi
+    return 0
+  fi
   echo "Starting MLflow UI (${uri}) on ${ui_url} (Ctrl-C to stop)…"
   if [[ "${open_browser}" -eq 1 ]] && command -v open >/dev/null 2>&1; then
     (
@@ -506,6 +546,12 @@ cmd_eval() {
   uri="$(resolve_mlflow_uri)"
   mkdir -p "${ROOT}/.data"
 
+  # Start and open MLflow UI *before* the eval starts so progress and per-case
+  # traces/runs can be watched live while the suite runs.
+  if [[ "${open_ui}" -eq 1 && "${info_only}" -eq 0 ]]; then
+    start_mlflow_bg 1
+  fi
+
   local extra_flags=()
   if [[ "${has_base_url}" -eq 0 ]]; then
     extra_flags+=(--base-url "http://127.0.0.1:${LLAMA_PORT}/v1")
@@ -523,10 +569,6 @@ cmd_eval() {
       "${extra_flags[@]}" \
       "${forward_args[@]+"${forward_args[@]}"}"
   )
-
-  if [[ "${open_ui}" -eq 1 && "${info_only}" -eq 0 ]]; then
-    cmd_mlflow
-  fi
 }
 
 usage() {

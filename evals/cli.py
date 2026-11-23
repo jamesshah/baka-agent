@@ -19,9 +19,9 @@ from evals.client import OpenAICompatClient, SamplingParams
 from evals.report import (
     DEFAULT_MLFLOW_URI,
     DEFAULT_OUTPUT_DIR,
+    LiveMlflowTracker,
     build_report_payload,
     format_markdown_report,
-    log_to_mlflow,
     write_report_files,
 )
 from evals.runner import CaseRunResult, run_case
@@ -198,10 +198,29 @@ def run_eval_suite(
         model_name = args.model or getattr(llm, "model", None) or "fake-llm"
 
     repeats = max(1, int(args.repeats))
+    total_runs = len(selected) * repeats
+    tracker: LiveMlflowTracker | None = None
+    if args.mlflow:
+        tracker = LiveMlflowTracker(tracking_uri=args.mlflow_uri)
+        tracker.start_suite(
+            model=model_name,
+            base_url=args.base_url,
+            ablation=ablation,
+            sampling=sampling,
+            repeats=repeats,
+            total_runs=total_runs,
+        )
+
     results: list[CaseRunResult] = []
+    step = 0
     try:
         for case in selected:
             for rep in range(1, repeats + 1):
+                step += 1
+                print(
+                    f"[{step}/{total_runs}] Running {case.id} (repeat {rep})…",
+                    flush=True,
+                )
                 result = run_case(
                     case,
                     active_llm,
@@ -209,6 +228,19 @@ def run_eval_suite(
                     repeat=rep,
                 )
                 results.append(result)
+                status = "PASS" if result.scores.all_passed else "FAIL"
+                print(
+                    f"[{step}/{total_runs}] {status} {case.id} "
+                    f"({result.wall_ms:.0f}ms, prompt={result.prompt_tokens}, "
+                    f"comp={result.completion_tokens})",
+                    flush=True,
+                )
+                if tracker is not None:
+                    tracker.log_case_step(
+                        result,
+                        step=step,
+                        results_so_far=results,
+                    )
     finally:
         if owned_client is not None:
             owned_client.close()
@@ -222,12 +254,11 @@ def run_eval_suite(
         repeats=repeats,
     )
     json_path, md_path = write_report_files(payload, output_dir=args.output_dir)
-    if args.mlflow:
-        log_to_mlflow(
+    if tracker is not None:
+        tracker.finish_suite(
             payload,
             json_path=json_path,
             md_path=md_path,
-            tracking_uri=args.mlflow_uri,
         )
     return payload, json_path, md_path
 
