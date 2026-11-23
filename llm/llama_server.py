@@ -11,6 +11,7 @@ import httpx
 
 from llm.base import LLMClient
 from llm.perf import log_completion, n_ctx_from_props, prompt_cache_health
+from tracing import prompt_breakdown, sanitize_messages, set_llm_span_metrics, trace_span
 
 logger = logging.getLogger(__name__)
 
@@ -231,40 +232,105 @@ class LlamaServerAdapter(LLMClient):
         if tools:
             payload["tools"] = tools
 
-        started = time.perf_counter()
-        with httpx.Client(timeout=timeout if timeout is not None else self._timeout) as client:
-            response = client.post(url, json=payload)
-            response.raise_for_status()
-            data = response.json()
-            wall_ms = (time.perf_counter() - started) * 1000.0
-            if isinstance(data, dict):
-                try:
-                    self._log_chat_perf(client, data, wall_ms)
-                except Exception:
-                    logger.exception("failed to log llm perf")
+        session_id, turn_id, label, iteration = _request_context()
+        breakdown = prompt_breakdown(messages, tools)
+        span_name = f"llm:{label}" if label else "llm:chat"
 
-        choices = data.get("choices") or []
-        if not choices:
-            raise RuntimeError(f"LLM returned no choices: {data}")
-        message = choices[0].get("message")
-        if not isinstance(message, dict):
-            raise RuntimeError(f"LLM returned invalid message: {data}")
-        return message
+        sampling_sent = {
+            key: payload[key]
+            for key in ("temperature", "top_p", "top_k", "repeat_penalty")
+            if key in payload
+        }
+        with trace_span(
+            span_name,
+            span_type="CHAT_MODEL",
+            inputs={
+                "messages": sanitize_messages(messages),
+                "tools": breakdown["tool_names"],
+                "model": self._model,
+                "sampling": sampling_sent,
+            },
+            attributes={
+                "agent_label": label,
+                "iteration": iteration,
+                "turn_id": turn_id,
+                "prompt.system_chars": breakdown["system_chars"],
+                "prompt.tools_chars": breakdown["tools_chars"],
+                "prompt.tool_count": breakdown["tool_count"],
+                "prompt.history_messages": breakdown["history_messages"],
+                "prompt.history_chars": breakdown["history_chars"],
+                "prompt.context_block_chars": breakdown["context_block_chars"],
+                "prompt.current_user_chars": breakdown["current_user_chars"],
+                "prompt.tool_result_messages": breakdown["tool_result_messages"],
+                "prompt.tool_result_chars": breakdown["tool_result_chars"],
+                "prompt.total_chars": breakdown["total_chars"],
+                "prompt.estimated_tokens": breakdown["estimated_tokens"],
+            },
+        ) as llm_span:
+            started = time.perf_counter()
+            metrics: dict[str, Any] | None = None
+            with httpx.Client(timeout=timeout if timeout is not None else self._timeout) as client:
+                response = client.post(url, json=payload)
+                response.raise_for_status()
+                data = response.json()
+                wall_ms = (time.perf_counter() - started) * 1000.0
+                if isinstance(data, dict):
+                    try:
+                        metrics = self._log_chat_perf(
+                            client,
+                            data,
+                            wall_ms,
+                            session_id=session_id,
+                            turn_id=turn_id,
+                            label=label,
+                        )
+                    except Exception:
+                        logger.exception("failed to log llm perf")
+
+            choices = data.get("choices") or []
+            if not choices:
+                raise RuntimeError(f"LLM returned no choices: {data}")
+            first_choice = choices[0] if isinstance(choices[0], dict) else {}
+            message = first_choice.get("message")
+            if not isinstance(message, dict):
+                raise RuntimeError(f"LLM returned invalid message: {data}")
+
+            if metrics is not None:
+                set_llm_span_metrics(llm_span, metrics, tools=tools)
+            llm_span.set_outputs(
+                {
+                    "role": message.get("role"),
+                    "content": message.get("content"),
+                    "reasoning_content": (
+                        message.get("reasoning_content")
+                        or message.get("reasoning")
+                    ),
+                    "tool_calls": message.get("tool_calls"),
+                    "finish_reason": first_choice.get("finish_reason"),
+                }
+            )
+            return message
 
     def _log_chat_perf(
         self,
         client: httpx.Client,
         data: dict[str, Any],
         wall_ms: float,
-    ) -> None:
-        session_id, turn_id = _request_ids()
-        log_completion(
+        *,
+        session_id: str | None = None,
+        turn_id: str | None = None,
+        label: str | None = None,
+    ) -> dict[str, Any]:
+        if session_id is None and turn_id is None and label is None:
+            session_id, turn_id, label, _ = _request_context()
+        return log_completion(
             data,
             wall_ms=wall_ms,
             n_ctx=self._ensure_n_ctx(client),
             model=self._model,
             session_id=session_id,
             turn_id=turn_id,
+            label=label,
         )
 
     def _ensure_n_ctx(self, client: httpx.Client) -> int | None:
@@ -329,11 +395,21 @@ def runtime_from_props(props: dict[str, Any] | None) -> dict[str, Any]:
 
 
 def _request_ids() -> tuple[str | None, str | None]:
+    session_id, turn_id, _, _ = _request_context()
+    return session_id, turn_id
+
+
+def _request_context() -> tuple[str | None, str | None, str | None, int | None]:
     try:
-        from tools.session_context import get_session_id, get_turn_id
+        from tools.session_context import (
+            get_llm_iteration,
+            get_llm_label,
+            get_session_id,
+            get_turn_id,
+        )
     except ImportError:
-        return None, None
-    return get_session_id(), get_turn_id()
+        return None, None, None, None
+    return get_session_id(), get_turn_id(), get_llm_label(), get_llm_iteration()
 
 
 def _parse_input_modalities(

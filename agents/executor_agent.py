@@ -9,6 +9,7 @@ from agents.loop import run_tool_loop
 from llm.base import LLMClient
 from tools.registry import ToolRegistry
 from tools.session_context import get_turn_id
+from tracing import trace_span
 
 logger = logging.getLogger(__name__)
 
@@ -69,15 +70,35 @@ class ExecutorAgent:
             {"role": "user", "content": task},
         ]
         result = ""
-        for text in run_tool_loop(
-            self._llm,
-            history,
-            granted,
-            session_id=session_id,
-            max_iterations=self._max_agent_iterations,
-            tool_specs=granted.specs(),
-            label="executor",
-            turn_id=turn_id,
-        ):
-            result = text
+        with trace_span(
+            "executor_task",
+            span_type="AGENT",
+            inputs={
+                "task": task,
+                "requested_tools": requested,
+            },
+            attributes={
+                "turn_id": turn_id,
+                "granted_tools": granted.names(),
+                "skipped_tools": skipped,
+                "max_iterations": self._max_agent_iterations,
+            },
+        ) as span:
+            for text in run_tool_loop(
+                self._llm,
+                history,
+                granted,
+                session_id=session_id,
+                max_iterations=self._max_agent_iterations,
+                tool_specs=granted.specs(),
+                label="executor",
+                turn_id=turn_id,
+            ):
+                result = text
+            span.set_outputs(
+                {
+                    "result": result,
+                    "message_count": len(history),
+                }
+            )
         return result

@@ -9,7 +9,8 @@ from typing import Any
 
 from llm.base import LLMClient
 from tools.registry import ToolRegistry
-from tools.session_context import reset_session_id, set_session_id
+from tools.session_context import llm_call_context, reset_session_id, set_session_id
+from tracing import trace_span
 
 logger = logging.getLogger(__name__)
 
@@ -60,7 +61,8 @@ def run_tool_loop(
                 session_id,
                 turn_id or "-",
             )
-            message = llm.chat(_for_llm(history), tools=specs, timeout=timeout)
+            with llm_call_context(label, iteration + 1):
+                message = llm.chat(_for_llm(history), tools=specs, timeout=timeout)
 
             tool_calls = list(message.get("tool_calls") or [])
             if tool_calls:
@@ -74,19 +76,46 @@ def run_tool_loop(
                     call_id = call.get("id") or name
                     parsed = _parse_arguments(arguments)
                     signature = _call_signature(name, parsed)
-                    if signature in executed:
-                        logger.warning(
-                            "repeated tool call skipped: %s(%s)", name, arguments
+                    with trace_span(
+                        f"tool:{name or 'unknown'}",
+                        span_type="TOOL",
+                        inputs={
+                            "name": name,
+                            "arguments": parsed,
+                            "raw_arguments": arguments,
+                        },
+                        attributes={
+                            "agent_label": label,
+                            "iteration": iteration + 1,
+                            "turn_id": turn_id,
+                            "tool_call_id": call_id,
+                        },
+                    ) as tool_span:
+                        if signature in executed:
+                            logger.warning(
+                                "repeated tool call skipped: %s(%s)", name, arguments
+                            )
+                            result = _repeated_call_notice(name)
+                            tool_span.set_attribute("skipped_duplicate", True)
+                        else:
+                            executed.add(signature)
+                            logger.info("tool call: %s(%s)", name, arguments)
+                            if before_tool is not None:
+                                yield from before_tool(name, parsed)
+                            result = tools.execute(
+                                name, arguments, session_id=session_id
+                            )
+                            tool_span.set_attribute("skipped_duplicate", False)
+                        is_error = _is_tool_error(result)
+                        tool_span.set_attributes(
+                            {
+                                "result_chars": len(result),
+                                "is_error": is_error,
+                            }
                         )
-                        result = _repeated_call_notice(name)
-                    else:
-                        executed.add(signature)
-                        logger.info("tool call: %s(%s)", name, arguments)
-                        if before_tool is not None:
-                            yield from before_tool(name, parsed)
-                        result = tools.execute(
-                            name, arguments, session_id=session_id
-                        )
+                        tool_span.set_outputs({"result": result})
+                        if is_error:
+                            tool_span.set_status_error(result)
                     history.append(
                         _with_turn_id(
                             {
@@ -157,3 +186,15 @@ def _parse_arguments(arguments: str | dict[str, Any] | None) -> dict[str, Any]:
     except json.JSONDecodeError:
         return {}
     return parsed if isinstance(parsed, dict) else {}
+
+
+_TOOL_ERROR_PREFIXES = (
+    "Unknown tool:",
+    "Invalid tool arguments JSON:",
+    "Tool call error:",
+    "Tool execution error:",
+)
+
+
+def _is_tool_error(result: str) -> bool:
+    return any(result.startswith(prefix) for prefix in _TOOL_ERROR_PREFIXES)

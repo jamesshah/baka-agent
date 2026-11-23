@@ -23,6 +23,7 @@ from events.rules import RuleEngine
 from events.triage import EventTriage, parse_quiet_hours
 from llm import LlamaServerAdapter
 from log_redact import configure_logging
+from tracing import configure_tracing, flush_traces, tracing_health
 from mcp_client import MultiServerMcpClient, load_mcp_config
 from mcp_client.token_store import FileTokenStore
 from memory import (
@@ -373,6 +374,11 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     global _mcp, _composio
     # Uvicorn installs its own handlers before import; wrap any added since.
     configure_logging()
+    configure_tracing(
+        enabled=_settings.mlflow_tracing_enabled,
+        tracking_uri=_settings.mlflow_tracking_uri,
+        experiment=_settings.mlflow_experiment,
+    )
     if _settings.memory_enabled:
         upgrade_database(_settings.database_path)
         indexed = _skill_indexer.sync() if _skill_indexer is not None else 0
@@ -431,6 +437,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         _memory_consolidator.close()
     if _database is not None:
         _database.close()
+    flush_traces()
 
 
 app = FastAPI(title="baka-agent", version="0.1.0", lifespan=lifespan)
@@ -533,6 +540,7 @@ def health() -> JSONResponse:
         "mcp": mcp_check,
         "composio": _composio_health(),
         "model": model_check,
+        "tracing": tracing_health(),
         "sendblue_webhook": webhook_check,
         "connectors": _connectors_health(),
     }

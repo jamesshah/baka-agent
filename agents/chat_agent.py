@@ -19,6 +19,7 @@ from tools.registry import ToolRegistry
 from tools.send_acknowledgement import SendAcknowledgementTool
 from tools.session_context import reset_turn_id, set_turn_id
 from tools.spawn_agent import SpawnAgentTool
+from tracing import session_hash, trace_span
 
 if TYPE_CHECKING:
     from memory.consolidator import MemoryConsolidator
@@ -288,65 +289,98 @@ class ChatAgent(Agent):
         turn_token = set_turn_id(turn_id)
         working: list[dict[str, Any]] | None = None
         completed = False
-        try:
-            working = self._begin_turn(
-                session_id,
-                turn_id,
-                user_text,
-                media,
-                source=source,
-                context_query=context_query,
+        emitted: list[str] = []
+        sess_tag = session_hash(session_id)
+        with trace_span(
+            "chat_turn",
+            span_type="AGENT",
+            inputs={
+                "user_text": user_text,
+                "has_media": media is not None,
+                "media_kind": media.kind if media is not None else None,
+                "source": source,
+            },
+            attributes={
+                "turn_id": turn_id,
+                "source": source,
+                "session_hash": sess_tag,
+            },
+        ) as turn_span:
+            turn_span.update_trace(
+                tags={"turn_id": turn_id, "source": source},
+                session_id=sess_tag,
+                request_preview=user_text.strip() or (f"[{media.kind}]" if media else ""),
             )
-
-            acked = False
-
-            def before_tool(name: str, kwargs: dict[str, Any]) -> Iterator[str]:
-                nonlocal acked
-                if not forward_acks:
-                    return
-                if name == SendAcknowledgementTool.name:
-                    msg = (kwargs.get("message")
-                           or "").strip() or _FALLBACK_ACK
-                    acked = True
-                    yield msg
-                elif name == SpawnAgentTool.name and not acked:
-                    acked = True
-                    yield _FALLBACK_ACK
-
-            chat_timeout = _MEDIA_CHAT_TIMEOUT_S if media is not None else None
-            chat_tools = self._tools.view(
-                self._tools.names(chat_agent=True),
-                worker_only=False,
-            )
-            yield from run_tool_loop(
-                self._llm,
-                working,
-                chat_tools,
-                session_id=session_id,
-                max_iterations=self._max_agent_iterations,
-                tool_specs=chat_tools.specs(),
-                timeout=chat_timeout,
-                label="chat",
-                turn_id=turn_id,
-                order_tool_calls=_order_chat_tool_calls,
-                before_tool=before_tool,
-                trim_history=self._trim_history,
-            )
-            completed = True
-        finally:
-            if working is not None:
-                self._commit_turn(
-                    session_id, turn_id, working, completed=completed
+            try:
+                working = self._begin_turn(
+                    session_id,
+                    turn_id,
+                    user_text,
+                    media,
+                    source=source,
+                    context_query=context_query,
                 )
-                if (
-                    completed
-                    and consolidate
-                    and self._memory_consolidator is not None
+
+                acked = False
+
+                def before_tool(name: str, kwargs: dict[str, Any]) -> Iterator[str]:
+                    nonlocal acked
+                    if not forward_acks:
+                        return
+                    if name == SendAcknowledgementTool.name:
+                        msg = (kwargs.get("message")
+                               or "").strip() or _FALLBACK_ACK
+                        acked = True
+                        yield msg
+                    elif name == SpawnAgentTool.name and not acked:
+                        acked = True
+                        yield _FALLBACK_ACK
+
+                chat_timeout = _MEDIA_CHAT_TIMEOUT_S if media is not None else None
+                chat_tools = self._tools.view(
+                    self._tools.names(chat_agent=True),
+                    worker_only=False,
+                )
+                for chunk in run_tool_loop(
+                    self._llm,
+                    working,
+                    chat_tools,
+                    session_id=session_id,
+                    max_iterations=self._max_agent_iterations,
+                    tool_specs=chat_tools.specs(),
+                    timeout=chat_timeout,
+                    label="chat",
+                    turn_id=turn_id,
+                    order_tool_calls=_order_chat_tool_calls,
+                    before_tool=before_tool,
+                    trim_history=self._trim_history,
                 ):
-                    self._memory_consolidator.submit(
-                        session_id, turn_id, user_text
+                    emitted.append(chunk)
+                    yield chunk
+                completed = True
+            finally:
+                turn_span.set_outputs(
+                    {
+                        "replies": emitted,
+                        "completed": completed,
+                        "history_messages": len(working) if working is not None else 0,
+                    }
+                )
+                if emitted:
+                    turn_span.update_trace(response_preview=emitted[-1])
+                if working is not None:
+                    self._commit_turn(
+                        session_id, turn_id, working, completed=completed
                     )
-            reset_turn_id(turn_token)
+                    if (
+                        completed
+                        and consolidate
+                        and self._memory_consolidator is not None
+                    ):
+                        self._memory_consolidator.submit(
+                            session_id, turn_id, user_text
+                        )
+                reset_turn_id(turn_token)
 
 
 def _order_chat_tool_calls(

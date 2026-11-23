@@ -83,6 +83,8 @@ dotenv_get EMBEDDING_CACHE
 dotenv_get EMBEDDING_PORT
 dotenv_get AGENT_HOST
 dotenv_get AGENT_PORT
+dotenv_get MLFLOW_TRACKING_URI
+dotenv_get MLFLOW_PORT
 
 # Defaults when neither shell env nor .env set the value.
 LLAMA_HF_REPO="${LLAMA_HF_REPO:-unsloth/gemma-4-12b-it-GGUF:UD-Q4_K_XL}"
@@ -109,6 +111,8 @@ EMBEDDING_CACHE="${EMBEDDING_CACHE:-${EMBEDDING_HF_REPO%%:*}}"
 EMBEDDING_PORT="${EMBEDDING_PORT:-8081}"
 AGENT_HOST="${AGENT_HOST:-0.0.0.0}"
 AGENT_PORT="${AGENT_PORT:-8000}"
+MLFLOW_TRACKING_URI="${MLFLOW_TRACKING_URI:-sqlite:///${ROOT}/.data/mlflow.db}"
+MLFLOW_PORT="${MLFLOW_PORT:-5001}"
 LLAMA_HEALTH_URL="http://127.0.0.1:${LLAMA_PORT}/health"
 EMBEDDING_HEALTH_URL="http://127.0.0.1:${EMBEDDING_PORT}/health"
 AGENT_HEALTH_URL="http://127.0.0.1:${AGENT_PORT}/health"
@@ -418,6 +422,26 @@ cmd_logs() {
   esac
 }
 
+cmd_mlflow() {
+  local mlflow_bin="${ROOT}/.venv/bin/mlflow"
+  if [[ ! -x "${mlflow_bin}" ]]; then
+    echo "Missing ${mlflow_bin}. Install dependencies first: .venv/bin/pip install -r requirements.txt" >&2
+    exit 1
+  fi
+  local uri="${MLFLOW_TRACKING_URI}"
+  if [[ "${uri}" == sqlite:///* && "${uri}" != sqlite:////* && "${uri}" != "sqlite:///:memory:" ]]; then
+    local rel="${uri#sqlite:///}"
+    uri="sqlite:///${ROOT}/${rel}"
+  fi
+  mkdir -p "${ROOT}/.data"
+  echo "Starting MLflow UI (${uri}) on http://127.0.0.1:${MLFLOW_PORT} (Ctrl-C to stop)…"
+  exec "${mlflow_bin}" ui \
+    --backend-store-uri "${uri}" \
+    --host 127.0.0.1 \
+    --port "${MLFLOW_PORT}" \
+    --workers 1
+}
+
 usage() {
   cat <<'EOF'
 Run llama-server + baka-agent in the background (macOS).
@@ -429,6 +453,7 @@ Usage:
   ./run.sh status
   ./run.sh logs [llama|embedding|agent]
   ./run.sh migrate [upgrade|current|history]
+  ./run.sh mlflow                                # open local MLflow trace UI
 
 Examples:
   ./run.sh restart agent    # only re-run the agent
@@ -464,6 +489,7 @@ main() {
     restart) shift || true; cmd_restart "${1:-all}" ;;
     status) cmd_status ;;
     logs) shift || true; cmd_logs "${1:-both}" ;;
+    mlflow) cmd_mlflow ;;
     migrate)
       shift || true
       case "${1:-upgrade}" in

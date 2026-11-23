@@ -11,6 +11,8 @@ from datetime import datetime, time, tzinfo
 from typing import TYPE_CHECKING
 
 from events.rules import ACTIONS
+from tools.session_context import llm_call_context
+from tracing import trace_span
 
 if TYPE_CHECKING:
     from events.rules import RuleEngine
@@ -140,15 +142,23 @@ class EventTriage:
         if preferences:
             user += f"\n\nUser notification preferences:\n{preferences}"
         try:
-            response = self._llm.chat(
-                [
-                    {"role": "system", "content": _TRIAGE_PROMPT},
-                    {"role": "user", "content": user},
-                ],
-                temperature=0.0,
-                timeout=self._llm_timeout,
-            )
-            action, reason = _parse_llm_decision(response.get("content") or "")
+            with trace_span(
+                "event_triage.llm_decide",
+                span_type="CHAIN",
+                inputs={"event": payload},
+                attributes={"event_id": event.id, "source": event.source, "event_type": event.event_type},
+            ) as span:
+                with llm_call_context("triage"):
+                    response = self._llm.chat(
+                        [
+                            {"role": "system", "content": _TRIAGE_PROMPT},
+                            {"role": "user", "content": user},
+                        ],
+                        temperature=0.0,
+                        timeout=self._llm_timeout,
+                    )
+                action, reason = _parse_llm_decision(response.get("content") or "")
+                span.set_outputs({"action": action, "reason": reason})
         except Exception:  # noqa: BLE001 — triage must never drop an event
             logger.exception("LLM triage failed for event %s", event.id)
             return Decision(_FALLBACK_ACTION, "fallback", "model triage failed")
